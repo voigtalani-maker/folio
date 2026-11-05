@@ -5,21 +5,26 @@
   var el = UI.el, icon = UI.icon;
   var PW = Ink.PW, PH = Ink.PH;
 
-  var COLORS = ['#16202a', '#1f5fd0', '#d3302f', '#16833f', '#e8771a', '#7a3fc4', '#f4cf28', '#ec5c9a'];
-  var HIGHLIGHT = ['#ffe45c', '#8fe36f', '#6fd3f5', '#ff9ccb', '#ffb35c', '#c7a6ff'];
-  var SIZES = {
-    pen: [1.5, 2.5, 4, 7], pencil: [1.5, 2.5, 4, 7], highlighter: [14, 22, 32, 44],
-    eraser: [10, 22, 40, 70], shape: [1.5, 2.5, 4, 7], text: [20, 28, 40, 56]
+  // Black, walnut, dusty blue, sage, mustard, terracotta, dusty rose, plum.
+  var COLORS = ['#111111', '#6b4630', '#5b8fb0', '#7f9a76', '#c9a24b', '#c46f4a', '#c0737a', '#8a6a94'];
+  var HIGHLIGHT = ['#f2d675', '#a9d08e', '#8fc7e8', '#f0a6b5', '#f4b183', '#bfa3e0'];
+  var OLD_DEFAULTS = { '#16202a': COLORS[0], '#47525c': COLORS[0], '#ffe45c': HIGHLIGHT[0] };
+  // Smallest and largest size per tool. The slider can land on anything in between.
+  var RANGES = {
+    pen: [0.5, 40], fountain: [0.5, 40], brush: [0.5, 40], pencil: [0.5, 40], highlighter: [6, 120], eraser: [6, 200], shape: [0.5, 40], text: [12, 120]
   };
   var TOOLS = [
-    ['pen', 'Pen'], ['pencil', 'Pencil'], ['highlighter', 'Highlighter'], ['eraser', 'Eraser'],
+    ['pen', 'Pen'], ['fountain', 'Fountain pen'], ['brush', 'Brush'], ['pencil', 'Pencil'],
+    ['highlighter', 'Highlighter'], ['eraser', 'Eraser'],
     ['lasso', 'Lasso select'], ['shape', 'Shapes'], ['text', 'Text']
   ];
   var SETTINGS_KEY = 'folio.settings';
   var DEFAULTS = {
-    tool: 'pen', shape: 'rect', eraserMode: 'area', fingerDraw: false, lowLatency: true,
+    tool: 'pen', shape: 'rect', eraserMode: 'area', fingerDraw: false, lowLatency: true, dock: null, recent: [],
+    shapeFix: false, toolOrder: null, toolHidden: [],
     t: {
-      pen: { color: COLORS[0], width: 2.5 }, pencil: { color: '#47525c', width: 2.5 },
+      pen: { color: COLORS[0], width: 2.5 }, pencil: { color: COLORS[0], width: 2.5 },
+      fountain: { color: COLORS[0], width: 5 }, brush: { color: COLORS[0], width: 7 },
       highlighter: { color: HIGHLIGHT[0], width: 22 }, eraser: { width: 22 },
       shape: { color: COLORS[0], width: 2.5 }, text: { color: COLORS[0], width: 28 }
     }
@@ -33,10 +38,13 @@
   var lastPen = 0, seenRaw = false;
   var sel = null, textEd = null;
   var assets = {}, io = null;
-  var dirty = new Set(), noteDirty = false, saveTimer = 0, zoomTimer = 0, clearTimer = 0;
-  var live = null, liveCtx = null, liveOwner = null, rafPending = false;
+  var dirty = new Set(), noteDirty = false, saveTimer = 0, zoomTimer = 0, clearTimer = 0, pullTimer = 0;
+  var live = null, liveCtx = null, liveOwner = null, liveLowLatency = false, rafPending = false;
+  var INK_TOOLS = ['pen', 'fountain', 'brush', 'pencil', 'highlighter'];
+  var dropping = false, clipboard = [];
+  var rec = null, player = null, recTimer = 0;
   var stats = { type: '-', pMin: 1, pMax: 0, events: 0, coalesced: 0, frames: 0, start: 0, end: 0 };
-  var dom = {};
+  var dom = {}, unlocked = {};
 
   function loadSettings() {
     var saved = null;
@@ -45,6 +53,9 @@
     if (saved) {
       Object.keys(c).forEach(function (k) { if (k !== 't' && saved[k] !== undefined) c[k] = saved[k]; });
       if (saved.t) Object.keys(c.t).forEach(function (k) { Object.assign(c.t[k], saved.t[k]); });
+      Object.keys(c.t).forEach(function (k) {
+        if (OLD_DEFAULTS[c.t[k].color]) c.t[k].color = OLD_DEFAULTS[c.t[k].color];
+      });
     }
     return c;
   }
@@ -63,10 +74,10 @@
   function cssWidth() { return Math.round(baseWidth * zoom); }
 
   function layout() {
-    var w = cssWidth(), h = Math.round(w * PH / PW);
+    var w = cssWidth();
     views.forEach(function (v) {
       v.el.style.width = w + 'px';
-      v.el.style.height = h + 'px';
+      v.el.style.height = Math.round(w * H(v.page) / PW) + 'px';
     });
     dom.pages.style.width = w + 'px';
   }
@@ -78,26 +89,27 @@
     return baseWidth !== old;
   }
 
-  function ratioFor(w) {
-    var dpr = window.devicePixelRatio || 1, h = w * PH / PW;
+  function H(page) { return page.h || PH; }
+
+  function ratioFor(w, page) {
+    var dpr = window.devicePixelRatio || 1, h = w * H(page) / PW;
     return Math.min(dpr, Math.sqrt(16000000 / (w * h)));
   }
 
   function renderView(v) {
-    var w = cssWidth(), r = ratioFor(w);
-    var pxW = Math.round(w * r), pxH = Math.round(pxW * PH / PW);
+    var w = cssWidth(), r = ratioFor(w, v.page);
+    var pxW = Math.round(w * r), pxH = Math.round(pxW * H(v.page) / PW);
     v.canvas.width = pxW;
     v.canvas.height = pxH;
     var ctx = v.canvas.getContext('2d');
-    ctx.setTransform(pxW / PW, 0, 0, pxH / PH, 0, 0);
+    ctx.setTransform(pxW / PW, 0, 0, pxW / PW, 0, 0);
     paintPage(ctx, v.page);
     v.stale = false;
     loadMissingAssets(v.page);
   }
 
   function paintPage(ctx, page) {
-    Ink.drawPaper(ctx, page.paper);
-    page.items.forEach(function (it) { Ink.drawItem(ctx, it, assets); });
+    Ink.drawPage(ctx, page, assets);
   }
 
   function refresh(page) {
@@ -119,15 +131,19 @@
   }
 
   function loadMissingAssets(page) {
-    page.items.forEach(function (it) {
-      if (it.type !== 'image' || assets[it.asset] !== undefined) return;
+    var wanted = page.items.filter(function (it) { return it.type === 'image'; });
+    if (page.bg) wanted = wanted.concat([page.bg]);
+    wanted.forEach(function (it) {
+      if (assets[it.asset] !== undefined) return;
       assets[it.asset] = null;
       Store.get('assets', it.asset).then(function (a) {
+        return a || (it.type === 'image' ? Folio.Sync.fetchAsset(it.asset) : null);
+      }).then(function (a) {
         if (!a) return null;
         return createImageBitmap(a.blob).then(function (bmp) {
           assets[it.asset] = bmp;
           pages.forEach(function (p) {
-            if (p.items.some(function (x) { return x.asset === it.asset; })) refresh(p);
+            if ((p.bg && p.bg.asset === it.asset) || p.items.some(function (x) { return x.asset === it.asset; })) refresh(p);
           });
         });
       }).catch(function () { UI.toast('An image in this note could not be loaded.'); });
@@ -163,17 +179,20 @@
 
   // ---------- Live ink layer ----------
 
-  function prepareLive(v) {
+  function prepareLive(v, pointerType) {
+    // Low-latency mode can flicker on some screens, so only a real pen gets it.
+    var lowLatency = cfg.lowLatency && pointerType === 'pen';
+    if (live && liveLowLatency !== lowLatency) { live.remove(); live = null; liveCtx = null; }
     if (!live) {
       live = el('canvas.live');
-      var opts = cfg.lowLatency ? { desynchronized: true } : {};
-      liveCtx = live.getContext('2d', opts) || live.getContext('2d');
+      liveLowLatency = lowLatency;
+      liveCtx = live.getContext('2d', lowLatency ? { desynchronized: true } : {}) || live.getContext('2d');
     }
     clearTimeout(clearTimer);
     if (live.parentNode !== v.el) v.el.appendChild(live);
     var pxW = v.canvas.width, pxH = v.canvas.height;
     if (live.width !== pxW || live.height !== pxH) { live.width = pxW; live.height = pxH; }
-    liveCtx.setTransform(pxW / PW, 0, 0, pxH / PH, 0, 0);
+    liveCtx.setTransform(pxW / PW, 0, 0, pxW / PW, 0, 0);
     clearLive();
     liveOwner = v;
   }
@@ -186,11 +205,18 @@
     liveCtx.restore();
   }
 
+  // The layer only exists on the page during a stroke, so it can't flicker while idle.
+  function parkLive() {
+    clearLive();
+    if (live) live.remove();
+    liveOwner = null;
+  }
+
   // Keeps wet ink up until the page beneath has painted, so it does not blink.
   function clearLiveSoon() {
     requestAnimationFrame(function () {
       requestAnimationFrame(function () {
-        if (!act) { clearLive(); liveOwner = null; }
+        if (!act) parkLive();
       });
     });
   }
@@ -245,9 +271,9 @@
     var first = pages[0];
     if (!first) return null;
     var c = document.createElement('canvas');
-    c.width = 360; c.height = Math.round(360 * PH / PW);
+    c.width = 360; c.height = Math.round(360 * H(first) / PW);
     var ctx = c.getContext('2d');
-    ctx.setTransform(c.width / PW, 0, 0, c.height / PH, 0, 0);
+    ctx.setTransform(c.width / PW, 0, 0, c.width / PW, 0, 0);
     paintPage(ctx, first);
     return c.toDataURL('image/webp', 0.7);
   }
@@ -262,6 +288,9 @@
     note.updated = Date.now();
     note.pageIds = pages.map(function (p) { return p.id; });
     note.thumb = makeThumb();
+    note.searchText = [note.pdfText || ''].concat(pages.map(function (p) {
+      return p.items.filter(function (it) { return it.type === 'text' || it.type === 'attach'; }).map(function (it) { return it.text || it.name || ''; }).join(' ');
+    })).join(' ').slice(0, 500000);
     var current = note;
     return Store.putMany('pages', list).then(function () {
       return Store.put('notes', current);
@@ -278,7 +307,7 @@
   // ---------- Pointer input ----------
 
   function pagePoint(e, rect) {
-    return { x: (e.clientX - rect.left) / rect.width * PW, y: (e.clientY - rect.top) / rect.height * PH };
+    return { x: (e.clientX - rect.left) / rect.width * PW, y: (e.clientY - rect.top) / rect.width * PW };
   }
 
   function pageViewAt(target, x, y) {
@@ -309,6 +338,7 @@
   }
 
   function startAction(e) {
+    if (note.shared && !note.shared.canEdit) return;
     var t = e.target;
     commitTextIfOutside(t);
 
@@ -318,7 +348,7 @@
       startSelectionDrag(e, !!t.closest('.sel-handle'));
       return;
     }
-    if (sel) clearSelection();
+    if (sel && !dropping) clearSelection();
 
     var v = pageViewAt(t, e.clientX, e.clientY);
     if (!v) return;
@@ -331,8 +361,10 @@
     var p = pagePoint(e, rect);
     var base = { pointerId: e.pointerId, pointerType: e.pointerType, v: v, rect: rect, before: v.page.items };
 
-    if (tool === 'pen' || tool === 'pencil' || tool === 'highlighter') {
-      prepareLive(v);
+    if (dropping) {
+      act = Object.assign(base, { kind: 'dropper', point: p });
+    } else if (INK_TOOLS.indexOf(tool) >= 0) {
+      prepareLive(v, e.pointerType);
       live.classList.toggle('multiply', tool === 'highlighter');
       var opts = cfg.t[tool];
       act = Object.assign(base, {
@@ -343,17 +375,17 @@
       addInkPoint(e, rect);
       paintLive();
     } else if (tool === 'eraser') {
-      prepareLive(v);
+      prepareLive(v, e.pointerType);
       live.classList.remove('multiply');
       act = Object.assign(base, { kind: 'erase', radius: cfg.t.eraser.width / 2, last: p });
       eraseAt(p);
       drawEraserRing(p);
     } else if (tool === 'lasso') {
-      prepareLive(v);
+      prepareLive(v, e.pointerType);
       live.classList.remove('multiply');
       act = Object.assign(base, { kind: 'lasso', poly: [p.x, p.y] });
     } else if (tool === 'shape') {
-      prepareLive(v);
+      prepareLive(v, e.pointerType);
       live.classList.remove('multiply');
       var so = cfg.t.shape;
       act = Object.assign(base, {
@@ -378,7 +410,7 @@
   }
 
   function addInkPoint(e, rect) {
-    var it = act.item, x = (e.clientX - rect.left) / rect.width * PW, y = (e.clientY - rect.top) / rect.height * PH;
+    var it = act.item, x = (e.clientX - rect.left) / rect.width * PW, y = (e.clientY - rect.top) / rect.width * PW;
     var n = it.pts.length;
     if (n && Math.hypot(it.pts[n - 3] - x, it.pts[n - 2] - y) < 0.35) return;
     var raw = e.pointerType === 'pen' ? e.pressure : 0.5;
@@ -472,7 +504,7 @@
     if (!act || act.kind !== 'lasso') return;
     clearLive();
     liveCtx.save();
-    liveCtx.strokeStyle = '#1f5c4d';
+    liveCtx.strokeStyle = '#3f7ea6';
     liveCtx.lineWidth = 2;
     liveCtx.setLineDash([8, 7]);
     liveCtx.beginPath();
@@ -517,31 +549,61 @@
     var page = a.v.page;
     if (a.kind === 'ink') {
       if (!a.item.pts.length) { clearLiveSoon(); return; }
-      page.items = a.before.concat([a.item]);
+      var finished = a.item;
+      if (cfg.shapeFix && finished.tool !== 'highlighter') {
+        var neat = Ink.recognizeShape(finished.pts);
+        if (neat) {
+          finished = Object.assign({ id: finished.id, type: 'shape', color: finished.color, width: finished.width }, neat);
+        }
+      }
+      stamp(finished);
+      page.items = a.before.concat([finished]);
       var ctx = a.v.canvas.getContext('2d');
-      Ink.drawItem(ctx, a.item, assets);
+      Ink.drawItem(ctx, finished, assets);
+      growIfNeeded(a.v, finished);
       clearLiveSoon();
       pushHistory(page, a.before);
       requestPersist();
     } else if (a.kind === 'erase') {
       renderView(a.v);
-      clearLive();
+      parkLive();
       if (page.items !== a.before) pushHistory(page, a.before);
     } else if (a.kind === 'lasso') {
-      clearLive();
-      selectByLasso(a.v, a.poly);
+      parkLive();
+      if (a.poly.length < 6 || lassoIsTap(a.poly)) tapActions(a.v, { x: a.poly[0], y: a.poly[1] });
+      else selectByLasso(a.v, a.poly);
     } else if (a.kind === 'shape') {
       clearLiveSoon();
       var it = a.item;
       if (Math.hypot(it.x2 - it.x1, it.y2 - it.y1) < 4) return;
+      stamp(it);
       page.items = a.before.concat([it]);
       Ink.drawItem(a.v.canvas.getContext('2d'), it, assets);
+      growIfNeeded(a.v, it);
       pushHistory(page, a.before);
     } else if (a.kind === 'seldrag') {
       if (page.items !== a.before) pushHistory(page, a.before);
     } else if (a.kind === 'texttap') {
       openTextAt(a.v, a.point);
+    } else if (a.kind === 'dropper') {
+      sampleColor(a.v, a.point);
     }
+  }
+
+  // Eyedropper: the next tap on the page picks up the colour under it.
+  function sampleColor(v, p) {
+    dropping = false;
+    var c = v.canvas, d = c.getContext('2d').getImageData(
+      Math.min(c.width - 1, Math.floor(p.x / PW * c.width)),
+      Math.min(c.height - 1, Math.floor(p.y / PW * c.width)), 1, 1).data;
+    var hex = '#' + [d[0], d[1], d[2]].map(function (n) { return ('0' + n.toString(16)).slice(-2); }).join('');
+    var opts = cfg.t[cfg.tool];
+    if (opts && opts.color) opts.color = hex;
+    if (sel) recolorSelection(hex);
+    cfg.recent = [hex].concat(cfg.recent.filter(function (x) { return x !== hex; })).slice(0, 8);
+    saveSettings();
+    buildToolbar();
+    UI.toast('Picked up ' + hex + '.');
   }
 
   function requestPersist() {
@@ -575,7 +637,7 @@
       act.v.page.items = act.before;
       refresh(act.v.page);
     }
-    clearLive();
+    parkLive();
     touches.delete(act.pointerId);
     act = null;
   }
@@ -597,6 +659,7 @@
     if (gesture.kind === 'pan') {
       dom.scroller.scrollLeft -= dx;
       dom.scroller.scrollTop -= dy;
+      trackPull(dy);
       var now = performance.now(), dt = Math.max(1, now - gesture.lastT);
       gesture.vx = gesture.vx * 0.7 + (dx / dt) * 0.3;
       gesture.vy = gesture.vy * 0.7 + (dy / dt) * 0.3;
@@ -612,7 +675,37 @@
     }
   }
 
+  // Drag up past the end of the last page and hold, and a new page appears.
+  var PULL_START = 70, PULL_HOLD = 600;
+
+  function trackPull(dy) {
+    var s = dom.scroller, g = gesture;
+    if (g.pullDone) return;
+    var atEnd = s.scrollTop + s.clientHeight >= s.scrollHeight - 2;
+    if (!atEnd) { g.pull = 0; clearPull(); return; }
+    g.pull = Math.max(0, (g.pull || 0) - dy);
+    if (g.pull < PULL_START) { clearPull(); return; }
+    if (pullTimer) return;
+    dom.pullHint.hidden = false;
+    pullTimer = setTimeout(function () {
+      pullTimer = 0;
+      dom.pullHint.hidden = true;
+      if (!gesture || gesture !== g || !note) return;
+      g.pullDone = true;
+      g.vx = 0; g.vy = 0;
+      addPage();
+      UI.toast('New page added.');
+    }, PULL_HOLD);
+  }
+
+  function clearPull() {
+    clearTimeout(pullTimer);
+    pullTimer = 0;
+    if (dom.pullHint) dom.pullHint.hidden = true;
+  }
+
   function onTouchUp(e) {
+    clearPull();
     var tp = touches.get(e.pointerId);
     touches.delete(e.pointerId);
     var was = gesture;
@@ -632,11 +725,23 @@
   }
 
   function onTap(e) {
+    if (dropping) {
+      var dv = pageViewAt(document.elementFromPoint(e.clientX, e.clientY), e.clientX, e.clientY);
+      if (dv) {
+        if (dv.stale) renderView(dv);
+        sampleColor(dv, pagePoint(e, dv.el.getBoundingClientRect()));
+      }
+      return;
+    }
+    var v = pageViewAt(document.elementFromPoint(e.clientX, e.clientY), e.clientX, e.clientY);
+    if (v) {
+      if (v.stale) renderView(v);
+      if (tapActions(v, pagePoint(e, v.el.getBoundingClientRect()))) return;
+    }
     if (cfg.tool !== 'text') {
       if (sel) clearSelection();
       return;
     }
-    var v = pageViewAt(document.elementFromPoint(e.clientX, e.clientY), e.clientX, e.clientY);
     if (!v) return;
     commitText();
     if (v.stale) renderView(v);
@@ -644,6 +749,7 @@
   }
 
   function endGesture() {
+    clearPull();
     touches.clear();
     gesture = null;
   }
@@ -689,7 +795,6 @@
     var ids = new Set();
     v.page.items.forEach(function (it) { if (Ink.insideLasso(it, poly)) ids.add(it.id); });
     if (ids.size) setSelection(v, ids);
-    clearLive();
   }
 
   function selectedItems() {
@@ -700,6 +805,7 @@
   function setSelection(v, ids) {
     clearSelection();
     var bar = el('div.sel-bar', null,
+      barButton('clip', 'Copy', copySelection),
       barButton('copy', 'Duplicate', duplicateSelection),
       barButton('trash', 'Delete', deleteSelection));
     var handle = el('div.sel-handle', { title: 'Drag to resize' });
@@ -719,9 +825,9 @@
     if (!r) { clearSelection(); return; }
     var s = sel.box.style;
     s.left = (r.x / PW * 100) + '%';
-    s.top = (r.y / PH * 100) + '%';
+    s.top = (r.y / H(sel.v.page) * 100) + '%';
     s.width = (r.w / PW * 100) + '%';
-    s.height = (r.h / PH * 100) + '%';
+    s.height = (r.h / H(sel.v.page) * 100) + '%';
     sel.box.classList.toggle('bar-below', r.y < 70);
     sel.rect = r;
   }
@@ -778,6 +884,40 @@
     setSelection(v, new Set(copies.map(function (c) { return c.id; })));
   }
 
+  function copySelection() {
+    clipboard = selectedItems();
+    UI.toast('Copied. Paste it from the ⋯ menu, on any page.');
+  }
+
+  function pasteClipboard() {
+    var v = currentPage();
+    if (!v || !clipboard.length) return;
+    if (v.stale) renderView(v);
+    var page = v.page, before = page.items;
+    var copies = clipboard.map(function (it) {
+      return Object.assign(Ink.transform(it, 26, 26, 1, 0, 0), { id: Ink.uid() });
+    });
+    page.items = before.concat(copies);
+    refresh(page);
+    pushHistory(page, before);
+    setTool('lasso');
+    setSelection(v, new Set(copies.map(function (c) { return c.id; })));
+  }
+
+  function addSticky() {
+    var v = currentPage();
+    if (!v) return;
+    if (v.stale) renderView(v);
+    var box = dom.scroller.getBoundingClientRect(), r = v.el.getBoundingClientRect();
+    var y = Math.max(60, Math.min(H(v.page) - 400, (box.top + box.height / 2 - r.top) / r.width * PW - 150));
+    var item = {
+      id: Ink.uid(), type: 'text', text: '', x: 340, y: y, w: 320, minH: 240, size: 28,
+      color: COLORS[0], bg: '#f2d675'
+    };
+    setTool('text');
+    startTextEdit(v, item, null);
+  }
+
   function recolorSelection(color) {
     var page = sel.v.page, before = page.items;
     page.items = before.map(function (it) {
@@ -804,20 +944,31 @@
       w: Math.min(620, PW - p.x - 24), size: opts.width, color: opts.color
     };
     if (item.w < 120) { item = Object.assign({}, item, { x: PW - 144, w: 120 }); }
-    var ta = el('textarea.text-editor', { 'aria-label': 'Text', spellcheck: 'true' });
-    ta.value = item.text;
+    startTextEdit(v, item, existing);
+  }
+
+  function startTextEdit(v, item, existing) {
+    var ta = el('div.text-editor', { contenteditable: 'true', role: 'textbox', 'aria-multiline': 'true', 'aria-label': 'Text', spellcheck: 'true' });
+    if (item.bg) { ta.style.background = item.bg; ta.style.minHeight = (item.minH || 0) * cssWidth() / PW + 'px'; }
+    if (item.html) {
+      ta.innerHTML = Ink.cleanHtml(item.html);
+    } else {
+      ta.textContent = item.text || '';
+    }
     var s = ta.style;
     s.left = (item.x / PW * 100) + '%';
-    s.top = (item.y / PH * 100) + '%';
+    s.top = (item.y / H(v.page) * 100) + '%';
     s.width = (item.w / PW * 100) + '%';
     s.font = (item.size * cssWidth() / PW) + 'px/' + Ink.LINE + ' ' + Ink.FONT;
     s.color = item.color;
-    function grow() {
-      ta.style.height = 'auto';
-      ta.style.height = (ta.scrollHeight + 2) + 'px';
-    }
-    ta.addEventListener('input', grow);
-    ta.addEventListener('blur', function () { setTimeout(commitText, 0); });
+    // Pasting always comes in as clean text with its line breaks, never as outside formatting.
+    ta.addEventListener('paste', function (e) {
+      var plain = e.clipboardData && e.clipboardData.getData('text/plain');
+      e.preventDefault();
+      e.stopPropagation();
+      if (plain) document.execCommand('insertText', false, plain.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, ''));
+    });
+    ta.addEventListener('blur', function () { setTimeout(function () { if (textEd && textEd.ta === ta) commitText(); }, 0); });
     v.el.appendChild(ta);
     textEd = { v: v, ta: ta, item: item, existing: existing };
     if (existing) {
@@ -829,34 +980,406 @@
     } else {
       textEd.before = v.page.items;
     }
-    grow();
+    dom.richBar.hidden = false;
     ta.focus();
+    var range = document.createRange();
+    range.selectNodeContents(ta);
+    range.collapse(false);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
   }
 
   function commitTextIfOutside(target) {
-    if (textEd && target !== textEd.ta) commitText();
+    if (textEd && !textEd.ta.contains(target)) commitText();
   }
 
   function commitText() {
     if (!textEd) return;
     var ed = textEd;
     textEd = null;
-    var value = ed.ta.value.replace(/\s+$/, '');
+    dom.richBar.hidden = true;
+    var value = ed.ta.innerText.replace(/\s+$/, '');
+    var html = Ink.cleanHtml(ed.ta.innerHTML);
+    var rich = /<(b|i|u|strong|em|font|ul|ol|table)\b/i.test(html);
     ed.ta.remove();
     var page = ed.v.page, before = ed.before;
-    if (ed.existing && value === ed.existing.text) {
+    var result = Object.assign({}, ed.item, { text: value });
+    if (rich) result.html = html; else delete result.html;
+    if (ed.existing && value === ed.existing.text && (result.html || '') === (ed.existing.html || '')) {
       page.items = before;
       refresh(page);
       return;
     }
-    if (!value && !ed.existing) return;
-    page.items = value
+    if (!value && !rich && !ed.existing) return;
+    if (!ed.existing) stamp(result);
+    page.items = value || rich
       ? (ed.existing
-        ? before.map(function (x) { return x === ed.existing ? Object.assign({}, ed.item, { text: value }) : x; })
-        : before.concat([Object.assign({}, ed.item, { text: value })]))
+        ? before.map(function (x) { return x === ed.existing ? result : x; })
+        : before.concat([result]))
       : before.filter(function (x) { return x !== ed.existing; });
     refresh(page);
     pushHistory(page, before);
+  }
+
+  function buildRichBar() {
+    function cmd(label, title, fn, html) {
+      var b = el('button', { type: 'button', title: title, 'aria-label': title, text: html ? null : label, html: html || null });
+      // Keeps the cursor in the text while a button is pressed.
+      b.addEventListener('pointerdown', function (e) { e.preventDefault(); });
+      b.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      b.addEventListener('click', function () {
+        if (!textEd) return;
+        document.execCommand('styleWithCSS', false, false);
+        fn();
+      });
+      return b;
+    }
+    function exec(name, value) { return function () { document.execCommand(name, false, value); }; }
+    var bar = dom.richBar;
+    bar.appendChild(cmd('', 'Bold', exec('bold'), '<b>B</b>'));
+    bar.appendChild(cmd('', 'Italic', exec('italic'), '<i>I</i>'));
+    bar.appendChild(cmd('', 'Underline', exec('underline'), '<u>U</u>'));
+    bar.appendChild(cmd('A−', 'Smaller text', exec('fontSize', '2')));
+    bar.appendChild(cmd('A', 'Normal text', exec('fontSize', '3')));
+    bar.appendChild(cmd('A+', 'Larger text', exec('fontSize', '5')));
+    bar.appendChild(cmd('•', 'Bulleted list', exec('insertUnorderedList')));
+    bar.appendChild(cmd('1.', 'Numbered list', exec('insertOrderedList')));
+    bar.appendChild(cmd('☐', 'Checkbox', exec('insertText', '☐ ')));
+    bar.appendChild(cmd('▦', 'Insert table', function () {
+      var row = '<tr><td><br></td><td><br></td><td><br></td></tr>';
+      document.execCommand('insertHTML', false, '<table><tbody>' + row + row + row + '</tbody></table><div><br></div>');
+    }));
+    COLORS.forEach(function (c) {
+      var b = cmd('', 'Text colour ' + c, exec('foreColor', c));
+      b.className = 'swatch';
+      b.style.background = c;
+      bar.appendChild(b);
+    });
+  }
+
+  // ---------- Tapping things on the page ----------
+
+  function lassoIsTap(poly) {
+    for (var i = 2; i < poly.length; i += 2) {
+      if (Math.hypot(poly[i] - poly[0], poly[i + 1] - poly[1]) > 10) return false;
+    }
+    return true;
+  }
+
+  // Handles a tap on a checkbox, an attachment, or (while a recording is open) your writing.
+  function tapActions(v, p) {
+    var items = v.page.items, ctx = measureCtx();
+    for (var i = items.length - 1; i >= 0; i--) {
+      var it = items[i];
+      if (it.type === 'text' && /[☐☑]/.test(it.text)) {
+        var box = Ink.checkboxAt(ctx, it, p.x, p.y);
+        if (box >= 0) {
+          var before = items;
+          var changed = Object.assign({}, it, { text: Ink.toggleBox(it.text, box) });
+          if (it.html) changed.html = Ink.toggleBox(it.html, box);
+          v.page.items = before.map(function (x) { return x === it ? changed : x; });
+          refresh(v.page);
+          pushHistory(v.page, before);
+          return true;
+        }
+      }
+      if (it.type === 'attach' && Ink.insideBox(it, p.x, p.y)) { openAttachment(it); return true; }
+    }
+    if (player) {
+      for (var j = items.length - 1; j >= 0; j--) {
+        var x = items[j];
+        if (!x.rec || x.rec.id !== player.id) continue;
+        var hit = x.type === 'stroke' ? Ink.hitsStroke(x, p.x, p.y, 14)
+          : x.type === 'shape' ? Ink.hitsShape(x, p.x, p.y, 14)
+            : Ink.insideBox(Object.assign({}, x, x.type === 'text' ? { w: x.w, h: Ink.bbox(x, ctx).h } : {}), p.x, p.y);
+        if (hit) {
+          player.audio.currentTime = Math.max(0, x.rec.t - 1);
+          player.audio.play().catch(function () {});
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function growIfNeeded(v, item) {
+    if (v.page.layout !== 'long') return;
+    var r = Ink.bbox(item, measureCtx());
+    if (r.y + r.h < H(v.page) - 300) return;
+    v.page.h = H(v.page) + 700;
+    layout();
+    renderView(v);
+    markDirty(v.page);
+  }
+
+  function pageSize(page) {
+    UI.sheet('Page size', [
+      { label: 'Standard portrait', value: 'portrait', checked: !page.layout || page.layout === 'portrait' },
+      { label: 'Landscape', value: 'landscape', checked: page.layout === 'landscape' },
+      { label: 'Long scrolling page', hint: 'Grows as you write', value: 'long', checked: page.layout === 'long' }
+    ]).then(function (choice) {
+      if (!choice) return;
+      var ctx = measureCtx(), lowest = page.bg ? page.bg.y + page.bg.h : 0;
+      page.items.forEach(function (it) {
+        var r = Ink.bbox(it, ctx);
+        lowest = Math.max(lowest, r.y + r.h);
+      });
+      var wanted = choice === 'landscape' ? 707 : PH;
+      page.layout = choice;
+      page.h = Math.max(wanted, Math.ceil(lowest + 20));
+      if (page.h > wanted && choice !== 'long') UI.toast('The page was kept taller so nothing on it gets cut off.');
+      rebuildPages(page.id);
+      markDirty(page);
+    });
+  }
+
+  // ---------- Attachments ----------
+
+  function placeAttachment(props) {
+    var v = currentPage();
+    if (!v) return;
+    if (v.stale) renderView(v);
+    var box = dom.scroller.getBoundingClientRect(), r = v.el.getBoundingClientRect();
+    var y = Math.max(40, Math.min(H(v.page) - 120, (box.top + box.height / 2 - r.top) / r.width * PW));
+    var before = v.page.items, item = Object.assign({ id: Ink.uid(), type: 'attach', x: 200, y: y, w: 600, h: 76 }, props);
+    v.page.items = before.concat([item]);
+    refresh(v.page);
+    pushHistory(v.page, before);
+    setTool('lasso');
+    setSelection(v, new Set([item.id]));
+  }
+
+  function openAttachment(it) {
+    if (it.kind === 'link') {
+      window.open(it.url, '_blank', 'noopener');
+      return;
+    }
+    Store.get('assets', it.asset).then(function (a) {
+      if (a) Folio.Docs.download(a.blob, it.name);
+      else UI.toast('That file could not be found.');
+    });
+  }
+
+  function addLink() {
+    UI.prompt('Paste a web link', '', 'Add link', 'url').then(function (txt) {
+      if (!txt) return;
+      var url = /^[a-z][a-z0-9+.-]*:/i.test(txt) ? txt : 'https://' + txt, parsed = null;
+      try { parsed = new URL(url); } catch (e) { /* reported below */ }
+      if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+        UI.toast('That does not look like a web link.');
+        return;
+      }
+      placeAttachment({ kind: 'link', url: parsed.href, name: parsed.hostname + parsed.pathname.replace(/\/$/, '') });
+    });
+  }
+
+  function chooseFile(accept, capture, handler) {
+    var input = el('input', { type: 'file', accept: accept || null, capture: capture || null, multiple: !capture && accept === 'image/*' });
+    input.addEventListener('change', function () {
+      Array.from(input.files).reduce(function (chain, f) {
+        return chain.then(function () { return handler(f); });
+      }, Promise.resolve());
+    });
+    input.click();
+  }
+
+  function addFile(f) {
+    var id = Ink.uid();
+    return Store.put('assets', { id: id, blob: f }).then(function () {
+      placeAttachment({ kind: 'file', asset: id, name: f.name });
+      requestPersist();
+    }).catch(function () { UI.toast('That file could not be saved.'); });
+  }
+
+  // Turns a photo of a page into clean, high-contrast black and white.
+  function addScan(f) {
+    return createImageBitmap(f).then(function (bmp) {
+      var scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height)), c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * scale);
+      c.height = Math.round(bmp.height * scale);
+      var ctx = c.getContext('2d');
+      ctx.drawImage(bmp, 0, 0, c.width, c.height);
+      var img = ctx.getImageData(0, 0, c.width, c.height), d = img.data;
+      for (var i = 0; i < d.length; i += 4) {
+        var g = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+        g = Math.max(0, Math.min(255, (g - 110) * 1.9 + 110));
+        d[i] = d[i + 1] = d[i + 2] = g;
+      }
+      ctx.putImageData(img, 0, 0);
+      return new Promise(function (resolve) { c.toBlob(resolve, 'image/webp', 0.85); });
+    }).then(addImageBlob).catch(function () { UI.toast('That scan could not be added.'); });
+  }
+
+  function insertMenu() {
+    UI.sheet('Insert', [
+      { label: 'Image', icon: 'image', value: 'image' },
+      { label: 'Take a photo', icon: 'camera', value: 'photo' },
+      { label: 'Scan a document', icon: 'camera', value: 'scan' },
+      { label: 'PDF pages', icon: 'file', value: 'pdf' },
+      { label: 'File', icon: 'file', value: 'file' },
+      { label: 'Link', icon: 'link', value: 'link' }
+    ]).then(function (v) {
+      if (v === 'image') pickImage();
+      else if (v === 'photo') chooseFile('image/*', 'environment', addImageBlob);
+      else if (v === 'scan') chooseFile('image/*', 'environment', addScan);
+      else if (v === 'file') chooseFile(null, null, addFile);
+      else if (v === 'link') addLink();
+      else if (v === 'pdf') chooseFile('application/pdf,.pdf', null, addPdfPages);
+    });
+  }
+
+  function addPdfPages(f) {
+    return Folio.Docs.pdfToPages(f, note.id, function (n, total) {
+      UI.toast('Importing page ' + n + ' of ' + total + '…');
+    }).then(function (r) {
+      var first = r.pages[0];
+      r.pages.forEach(function (p) { pages.push(p); dirty.add(p.id); });
+      note.pdfText = ((note.pdfText || '') + ' ' + r.text).slice(0, 500000);
+      rebuildPages(first && first.id);
+    }).catch(function (err) { UI.toast('Could not import that PDF: ' + err.message); });
+  }
+
+  function exportMenu() {
+    commitText();
+    UI.sheet('Export or share', [
+      { label: 'PDF', hint: 'All pages', value: 'pdf' },
+      { label: 'Image', hint: 'This page', value: 'png' },
+      { label: 'Word', hint: 'Pages as pictures', value: 'docx' },
+      { label: 'PowerPoint', hint: 'Pages as pictures', value: 'pptx' },
+      { label: 'Text file', hint: 'Typed text only', value: 'txt' }
+    ]).then(function (format) {
+      if (!format) return;
+      UI.toast('Preparing your file…');
+      var index = pages.indexOf(currentPage().page);
+      flush().then(function () {
+        return Folio.Docs.exportNote(note, pages, format, index);
+      }).then(function (file) {
+        return Folio.Docs.deliver(file, true);
+      }).then(function (how) {
+        if (how === 'saved') UI.toast('Saved to your downloads.');
+      }).catch(function (err) { UI.toast('Export failed: ' + err.message); });
+    });
+  }
+
+  // ---------- Voice recording ----------
+
+  function stamp(item) {
+    if (rec) item.rec = { id: rec.id, t: +((Date.now() - rec.start) / 1000).toFixed(1) };
+  }
+
+  function formatTime(s) {
+    s = Math.max(0, Math.floor(s));
+    var m = Math.floor(s / 60);
+    return (m >= 60 ? Math.floor(m / 60) + ':' + ('0' + (m % 60)).slice(-2) : m) + ':' + ('0' + (s % 60)).slice(-2);
+  }
+
+  function startRecording() {
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      UI.toast('Recording is not available in this browser.');
+      return;
+    }
+    closePlayer();
+    // The browser's own noise reduction is the free stand-in for Audio Eraser.
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).then(function (stream) {
+      var type = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].filter(function (t) { return MediaRecorder.isTypeSupported(t); })[0];
+      var recorder = new MediaRecorder(stream, Object.assign({ audioBitsPerSecond: 32000 }, type ? { mimeType: type } : {}));
+      var entry = { id: Ink.uid(), asset: Ink.uid(), name: 'Recording ' + new Date().toLocaleString(), duration: 0, created: Date.now() };
+      var chunks = [], lastSave = Date.now(), owner = note;
+      owner.recordings = (owner.recordings || []).concat([entry]);
+      markDirty();
+      function save() {
+        return Store.put('assets', { id: entry.asset, blob: new Blob(chunks, { type: recorder.mimeType || type }) });
+      }
+      recorder.ondataavailable = function (e) {
+        if (e.data && e.data.size) chunks.push(e.data);
+        // Saved as it goes, so a crash or dead battery loses seconds rather than the lecture.
+        if (Date.now() - lastSave > 20000) { lastSave = Date.now(); save(); }
+      };
+      recorder.onstop = function () {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        save().then(function () { return Store.put('notes', owner); }).then(function () {
+          UI.toast('Recording saved.');
+        }).catch(function () { UI.toast('The recording could not be saved.'); });
+      };
+      recorder.start(5000);
+      rec = { id: entry.id, entry: entry, recorder: recorder, start: Date.now(), wake: null };
+      if (navigator.wakeLock) navigator.wakeLock.request('screen').then(function (w) { if (rec) rec.wake = w; else w.release(); }).catch(function () {});
+      showRecordingBar();
+      requestPersist();
+    }).catch(function () {
+      UI.toast('Folio needs permission to use the microphone.');
+    });
+  }
+
+  function showRecordingBar() {
+    var bar = dom.recBar, time = el('span.rec-time', { text: '0:00' });
+    bar.innerHTML = '';
+    bar.appendChild(el('span.rec-dot'));
+    bar.appendChild(time);
+    bar.appendChild(el('button.btn', { type: 'button', text: 'Stop', on: { click: stopRecording } }));
+    bar.hidden = false;
+    clearInterval(recTimer);
+    recTimer = setInterval(function () {
+      if (rec) time.textContent = formatTime((Date.now() - rec.start) / 1000);
+    }, 500);
+  }
+
+  function stopRecording() {
+    if (!rec) return;
+    var r = rec;
+    rec = null;
+    clearInterval(recTimer);
+    dom.recBar.hidden = true;
+    r.entry.duration = Math.round((Date.now() - r.start) / 1000);
+    if (r.wake) r.wake.release().catch(function () {});
+    if (r.recorder.state !== 'inactive') r.recorder.stop();
+    markDirty();
+  }
+
+  function recordingsMenu() {
+    var list = note.recordings || [];
+    UI.sheet('Recordings', list.map(function (r) {
+      return { label: r.name, hint: formatTime(r.duration), icon: 'mic', value: r.id };
+    })).then(function (id) {
+      var r = list.find(function (x) { return x.id === id; });
+      if (r) openPlayer(r);
+    });
+  }
+
+  function openPlayer(r) {
+    closePlayer();
+    Store.get('assets', r.asset).then(function (a) {
+      if (!a) { UI.toast('That recording could not be found.'); return; }
+      var url = URL.createObjectURL(a.blob), audio = el('audio', { controls: true, src: url });
+      player = { id: r.id, audio: audio, url: url };
+      var bar = dom.recBar;
+      bar.innerHTML = '';
+      bar.appendChild(audio);
+      bar.appendChild(el('span.rec-hint', { text: 'Tap your writing to jump to that moment' }));
+      bar.appendChild(el('button.btn', { type: 'button', text: 'Save file', on: { click: function () {
+        Folio.Docs.download(a.blob, r.name.replace(/[\\/:*?"<>|]+/g, '-') + (a.blob.type.indexOf('mp4') >= 0 ? '.m4a' : '.webm'));
+      } } }));
+      bar.appendChild(el('button.btn', { type: 'button', text: 'Delete', on: { click: function () {
+        UI.confirm('Delete this recording?', 'Your notes stay. You can\'t undo this.', 'Delete', true).then(function (ok) {
+          if (!ok) return;
+          closePlayer();
+          note.recordings = note.recordings.filter(function (x) { return x.id !== r.id; });
+          Store.del('assets', r.asset);
+          markDirty();
+        });
+      } } }));
+      bar.appendChild(el('button.btn', { type: 'button', text: 'Close', on: { click: closePlayer } }));
+      bar.hidden = false;
+    });
+  }
+
+  function closePlayer() {
+    if (!player) return;
+    player.audio.pause();
+    URL.revokeObjectURL(player.url);
+    player = null;
+    if (dom.recBar) { dom.recBar.hidden = true; dom.recBar.innerHTML = ''; }
   }
 
   // ---------- Images ----------
@@ -949,7 +1472,8 @@
     var bar = dom.tools;
     bar.innerHTML = '';
     var tools = el('div.tool-group');
-    TOOLS.forEach(function (t) {
+    orderedTools().forEach(function (t) {
+      if (cfg.toolHidden.indexOf(t[0]) >= 0 && cfg.tool !== t[0]) return;
       tools.appendChild(el('button.tool' + (cfg.tool === t[0] ? '.on' : ''), {
         type: 'button', title: t[1], 'aria-label': t[1], 'aria-pressed': String(cfg.tool === t[0]),
         'data-tool': t[0], html: icon(t[0]), on: { click: function () { setTool(t[0]); } }
@@ -983,45 +1507,201 @@
       var opts = cfg.t[tool] || { color: COLORS[0] };
       var palette = tool === 'highlighter' ? HIGHLIGHT : COLORS;
       var colors = el('div.tool-group.colors');
+      function useColor(c) {
+        if (cfg.t[tool]) { opts.color = c; saveSettings(); }
+        if (sel) recolorSelection(c);
+        buildToolbar();
+      }
       palette.forEach(function (c) {
         colors.appendChild(el('button.swatch' + (opts.color === c ? '.on' : ''), {
           type: 'button', 'aria-label': 'Colour ' + c, style: 'background:' + c,
-          on: {
-            click: function () {
-              if (cfg.t[tool]) { opts.color = c; saveSettings(); }
-              if (sel) recolorSelection(c);
-              buildToolbar();
-            }
-          }
+          on: { click: function () { useColor(c); } }
         }));
       });
-      var custom = el('input.custom-color', { type: 'color', 'aria-label': 'Custom colour', title: 'Custom colour', value: opts.color || COLORS[0] });
-      custom.addEventListener('change', function () {
-        if (cfg.t[tool]) { opts.color = custom.value; saveSettings(); }
-        if (sel) recolorSelection(custom.value);
-        buildToolbar();
-      });
-      colors.appendChild(custom);
+      var isCustom = palette.indexOf(opts.color) < 0;
+      colors.appendChild(el('button.wheel-btn' + (isCustom ? '.on' : ''), {
+        type: 'button', title: 'Colour wheel', 'aria-label': 'Colour wheel',
+        on: {
+          click: function () {
+            UI.colorWheel(opts.color || COLORS[0], cfg.recent).then(function (c) {
+              if (!c) return;
+              cfg.recent = [c].concat(cfg.recent.filter(function (x) { return x !== c; })).slice(0, 8);
+              useColor(c);
+            });
+          }
+        }
+      }, el('span', { style: isCustom ? 'background:' + opts.color : null })));
+      colors.appendChild(el('button.tool.dropper' + (dropping ? '.on' : ''), {
+        type: 'button', title: 'Pick up a colour from the page', 'aria-label': 'Pick up a colour from the page', html: icon('dropper'),
+        on: {
+          click: function () {
+            dropping = !dropping;
+            buildToolbar();
+            if (dropping) UI.toast('Tap the colour you want on the page.');
+          }
+        }
+      }));
       bar.appendChild(colors);
     }
 
-    if (SIZES[tool]) {
-      var sizes = el('div.tool-group');
-      SIZES[tool].forEach(function (s, i) {
-        var dot = 4 + i * 4;
-        sizes.appendChild(el('button.size' + (cfg.t[tool].width === s ? '.on' : ''), {
-          type: 'button', 'aria-label': 'Size ' + (i + 1),
-          on: { click: function () { cfg.t[tool].width = s; saveSettings(); buildToolbar(); } }
-        }, el('span', { style: 'width:' + dot + 'px;height:' + dot + 'px' })));
-      });
-      bar.appendChild(sizes);
+    if (RANGES[tool]) bar.appendChild(sizeControl(tool));
+    if (dom.dock) placeDock();
+  }
+
+  function orderedTools() {
+    var order = cfg.toolOrder || [];
+    return TOOLS.slice().sort(function (a, b) {
+      var ia = order.indexOf(a[0]), ib = order.indexOf(b[0]);
+      if (ia < 0) ia = TOOLS.indexOf(a) + 100;
+      if (ib < 0) ib = TOOLS.indexOf(b) + 100;
+      return ia - ib;
+    });
+  }
+
+  function customiseToolbar() {
+    UI.showDialog(function (dlg, done) {
+      var list = el('div.custom-list');
+      function draw() {
+        list.innerHTML = '';
+        var tools = orderedTools();
+        tools.forEach(function (t, i) {
+          var shown = cfg.toolHidden.indexOf(t[0]) < 0;
+          var box = el('input', { type: 'checkbox', 'aria-label': 'Show ' + t[1] });
+          box.checked = shown;
+          box.addEventListener('change', function () {
+            var visible = tools.filter(function (x) { return cfg.toolHidden.indexOf(x[0]) < 0; }).length;
+            if (!box.checked && visible === 1) {
+              box.checked = true;
+              UI.toast('Keep at least one tool.');
+              return;
+            }
+            cfg.toolHidden = box.checked
+              ? cfg.toolHidden.filter(function (x) { return x !== t[0]; })
+              : cfg.toolHidden.concat(t[0]);
+            saveSettings();
+            buildToolbar();
+          });
+          function move(delta) {
+            var names = tools.map(function (x) { return x[0]; });
+            names.splice(i + delta, 0, names.splice(i, 1)[0]);
+            cfg.toolOrder = names;
+            saveSettings();
+            buildToolbar();
+            draw();
+          }
+          list.appendChild(el('div.custom-row', null,
+            el('label.custom-label', null, box, el('span.sheet-ic', { html: icon(t[0]) }), el('span', { text: t[1] })),
+            rowButton('up', 'Move ' + t[1] + ' up', i === 0, function () { move(-1); }),
+            rowButton('down', 'Move ' + t[1] + ' down', i === tools.length - 1, function () { move(1); })));
+        });
+      }
+      draw();
+      dlg.appendChild(el('div.dlg-body', null,
+        el('h2', { text: 'Customise toolbar' }),
+        el('p', { text: 'Tick the tools you want, and put them in your own order.' }),
+        list,
+        el('div.dlg-actions', null, el('button.btn.primary', { type: 'button', text: 'Done', on: { click: function () { done(null); } } }))));
+    });
+  }
+
+  function formatSize(v) { return String(Math.round(v * 10) / 10); }
+
+  function sizeControl(tool) {
+    var range = RANGES[tool], min = range[0], max = range[1], opts = cfg.t[tool];
+    // Curved so small pen sizes get most of the slider, where a small change matters most.
+    function toSlider(v) { return Math.round(Math.pow((v - min) / (max - min), 1 / 2.2) * 1000); }
+    function fromSlider(s) {
+      return Math.round((min + (max - min) * Math.pow(s / 1000, 2.2)) * 10) / 10;
     }
+    var dot = el('span');
+    var preview = el('span.size-preview', { 'aria-hidden': 'true' }, dot);
+    var value = el('button.size-value', { type: 'button', title: 'Type an exact size', 'aria-label': 'Type an exact size' });
+    var slider = el('input.size-slider', { type: 'range', min: 0, max: 1000, 'aria-label': 'Size' });
+    slider.value = String(toSlider(opts.width));
+
+    function show() {
+      var d = Math.max(2, Math.min(38, opts.width * cssWidth() / PW * (tool === 'text' ? 0.7 : 1)));
+      dot.style.width = dot.style.height = d + 'px';
+      dot.style.background = tool === 'eraser' ? 'transparent' : (opts.color || 'currentColor');
+      dot.style.boxShadow = tool === 'eraser' || opts.color === '#ffffff' ? 'inset 0 0 0 1.5px currentColor' : '';
+      value.textContent = formatSize(opts.width);
+    }
+    slider.addEventListener('input', function () { opts.width = fromSlider(+slider.value); show(); });
+    slider.addEventListener('change', saveSettings);
+    value.addEventListener('click', function () {
+      UI.prompt('Exact size (' + min + ' to ' + max + ')', formatSize(opts.width), 'Set size').then(function (txt) {
+        var n = parseFloat(String(txt).replace(',', '.'));
+        if (!isFinite(n)) return;
+        opts.width = Math.max(min, Math.min(max, n));
+        slider.value = String(toSlider(opts.width));
+        saveSettings();
+        show();
+      });
+    });
+    show();
+    return el('div.tool-group.size-group', null, preview, slider, value);
+  }
+
+  // ---------- Movable toolbar ----------
+
+  var DOCK_TOP = 56, DOCK_EDGE = 8, SIDE_ZONE = 72;
+
+  function placeDock() {
+    var d = cfg.dock, node = dom.dock, s = node.style;
+    node.classList.toggle('vertical', !!(d && d.side));
+    if (!d) {
+      s.left = '50%'; s.top = (DOCK_TOP + 2) + 'px'; s.right = ''; s.transform = 'translateX(-50%)';
+      return;
+    }
+    var box = dom.editor.getBoundingClientRect(), w = node.offsetWidth, h = node.offsetHeight;
+    var y = Math.max(DOCK_TOP, Math.min(box.height - h - DOCK_EDGE, d.y));
+    s.transform = 'none';
+    s.top = y + 'px';
+    if (d.side === 'left') { s.left = DOCK_EDGE + 'px'; s.right = ''; }
+    else if (d.side === 'right') { s.left = 'auto'; s.right = DOCK_EDGE + 'px'; }
+    else {
+      s.right = '';
+      s.left = Math.max(DOCK_EDGE, Math.min(box.width - w - DOCK_EDGE, d.x)) + 'px';
+    }
+  }
+
+  function bindDock() {
+    var grip = document.getElementById('dockGrip'), drag = null;
+    grip.innerHTML = icon('grip');
+    grip.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      var r = dom.dock.getBoundingClientRect();
+      drag = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top };
+      try { grip.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+      dom.dock.classList.add('dragging');
+    });
+    grip.addEventListener('pointermove', function (e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      var box = dom.editor.getBoundingClientRect();
+      var px = e.clientX - box.left, side = null;
+      if (px < SIDE_ZONE) side = 'left';
+      else if (px > box.width - SIDE_ZONE) side = 'right';
+      // Changing shape moves the grip, so the hold point resets when it docks or undocks.
+      if (side !== (cfg.dock && cfg.dock.side) ) { drag.dx = 22; drag.dy = 22; }
+      cfg.dock = { x: px - drag.dx, y: e.clientY - box.top - drag.dy, side: side };
+      placeDock();
+    });
+    function end(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      drag = null;
+      dom.dock.classList.remove('dragging');
+      saveSettings();
+    }
+    grip.addEventListener('pointerup', end);
+    grip.addEventListener('pointercancel', end);
   }
 
   // ---------- Pages ----------
 
   function newPage(paper) {
-    return { id: Ink.uid(), noteId: note.id, paper: paper, items: [] };
+    var last = pages[pages.length - 1], page = { id: Ink.uid(), noteId: note.id, paper: paper, tint: last ? last.tint : undefined, items: [] };
+    if (last && last.layout) { page.layout = last.layout; page.h = last.layout === 'landscape' ? 707 : PH; }
+    return page;
   }
 
   function rebuildPages(scrollToId) {
@@ -1079,9 +1759,9 @@
       var list = el('div.page-list');
       function thumb(page) {
         var c = el('canvas');
-        c.width = 180; c.height = Math.round(180 * PH / PW);
+        c.width = 180; c.height = Math.round(180 * H(page) / PW);
         var ctx = c.getContext('2d');
-        ctx.setTransform(c.width / PW, 0, 0, c.height / PH, 0, 0);
+        ctx.setTransform(c.width / PW, 0, 0, c.width / PW, 0, 0);
         paintPage(ctx, page);
         return c;
       }
@@ -1138,26 +1818,68 @@
     if (scope === 'all') { note.paper = paper; }
   }
 
+  var TINTS = [
+    ['White', '#ffffff'], ['Soft blue', '#e8f3fa'], ['Warm sand', '#f6efe4'], ['Blush', '#faeeee'], ['Sage', '#eef3ea'], ['Soft grey', '#f0f0ee']
+  ];
+
+  function paperColour(page) {
+    UI.sheet('Paper colour', TINTS.map(function (t) {
+      return { label: t[0], value: t[1], checked: (page.tint || '#ffffff') === t[1] };
+    }).concat([{ label: 'Use the current colour on every page', value: 'all' }])).then(function (c) {
+      if (!c) return;
+      var list = c === 'all' ? pages : [page], tint = c === 'all' ? page.tint : c;
+      list.forEach(function (p) {
+        p.tint = tint;
+        refresh(p);
+        markDirty(p);
+      });
+    });
+  }
+
   function moreMenu() {
     var page = currentPage().page;
     UI.sheet('Note options', [
-      { label: 'Insert image', icon: 'image', value: 'image' },
-      { heading: 'Paper for this page' },
-      { label: 'Lined', value: 'p:lined', checked: page.paper === 'lined' },
-      { label: 'Grid', value: 'p:grid', checked: page.paper === 'grid' },
-      { label: 'Dotted', value: 'p:dots', checked: page.paper === 'dots' },
-      { label: 'Blank', value: 'p:blank', checked: page.paper === 'blank' },
-      { label: 'Use this paper on every page', value: 'all' },
+      { label: rec ? 'Stop recording' : 'Record audio', icon: 'mic', value: rec ? 'stoprec' : 'rec' },
+      (note.recordings || []).length ? { label: 'Recordings', icon: 'mic', hint: String(note.recordings.length), value: 'recs' } : null,
+      { label: 'Insert', icon: 'image', value: 'insert' },
+      { label: 'Export or share', icon: 'share', value: 'export' },
+      { label: 'Add sticky note', icon: 'notes', value: 'sticky' },
+      clipboard.length ? { label: 'Paste', icon: 'clip', value: 'paste' } : null,
+      { label: 'Page format', icon: 'pages', value: 'format' },
+      { label: 'Page size', icon: 'pages', value: 'size' },
+      { label: 'Paper colour', icon: 'shape', value: 'tint' },
+      { label: 'Customise toolbar', icon: 'sliders', value: 'custom' },
+      { label: 'Reset toolbar position', icon: 'grip', value: 'dock' },
       { heading: 'Pen' },
+      { label: 'Shape correction', hint: cfg.shapeFix ? 'On' : 'Off', value: 'shapefix' },
       { label: 'Draw with finger', hint: cfg.fingerDraw ? 'On' : 'Off', value: 'finger' },
       { label: 'Low-latency ink', hint: cfg.lowLatency ? 'On' : 'Off', value: 'latency' },
       { label: 'Pen check', hint: 'After you write a stroke', value: 'check' }
-    ]).then(function (v) {
+    ].filter(Boolean)).then(function (v) {
       if (!v) return;
-      if (v === 'image') pickImage();
-      else if (v.indexOf('p:') === 0) setPaper('page', v.slice(2));
-      else if (v === 'all') setPaper('all', page.paper);
-      else if (v === 'finger') {
+      if (v === 'insert') insertMenu();
+      else if (v === 'export') exportMenu();
+      else if (v === 'rec') startRecording();
+      else if (v === 'stoprec') stopRecording();
+      else if (v === 'recs') recordingsMenu();
+      else if (v === 'size') pageSize(page);
+      else if (v === 'sticky') addSticky();
+      else if (v === 'paste') pasteClipboard();
+      else if (v === 'custom') customiseToolbar();
+      else if (v === 'tint') paperColour(page);
+      else if (v === 'shapefix') {
+        cfg.shapeFix = !cfg.shapeFix;
+        saveSettings();
+        UI.toast(cfg.shapeFix ? 'Rough lines, rectangles and circles will be tidied.' : 'Shape correction is off.');
+      } else if (v === 'format') {
+        UI.formatPicker('Page format', page.paper, true).then(function (r) {
+          if (r) setPaper(r.all ? 'all' : 'page', r.id);
+        });
+      } else if (v === 'dock') {
+        cfg.dock = null;
+        saveSettings();
+        placeDock();
+      } else if (v === 'finger') {
         cfg.fingerDraw = !cfg.fingerDraw;
         saveSettings();
         UI.toast(cfg.fingerDraw ? 'One finger draws. Use two fingers to move the page.' : 'Fingers move the page. Only the pen draws.');
@@ -1207,6 +1929,13 @@
     dom.scroller = document.getElementById('scroller');
     dom.pages = document.getElementById('pages');
     dom.tools = document.getElementById('tools');
+    dom.dock = document.getElementById('dock');
+    dom.editor = document.getElementById('editor');
+    dom.pullHint = document.getElementById('pullHint');
+    dom.richBar = document.getElementById('richBar');
+    dom.recBar = document.getElementById('recBar');
+    buildRichBar();
+    bindDock();
     dom.undo = document.getElementById('undo');
     dom.redo = document.getElementById('redo');
     dom.status = document.getElementById('status');
@@ -1251,13 +1980,14 @@
     window.addEventListener('resize', function () {
       if (!note) return;
       if (measureBase()) { layout(); markAllStale(); }
+      placeDock();
     });
     document.addEventListener('visibilitychange', function () {
       if (document.visibilityState === 'hidden' && note) { commitText(); flush(); }
     });
     window.addEventListener('pagehide', function () { if (note) { commitText(); flush(); } });
     document.addEventListener('keydown', function (e) {
-      if (!note || e.target.matches('input,textarea')) return;
+      if (!note || e.target.matches('input,textarea,[contenteditable]')) return;
       var mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
       if (mod && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
       else if (mod && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
@@ -1269,9 +1999,27 @@
     bindOnce();
     return Promise.all([Store.get('notes', noteId), Store.pagesOf(noteId)]).then(function (r) {
       if (!r[0]) return false;
+      if (r[0].lock && !unlocked[noteId]) {
+        return UI.prompt('This note is locked. Enter its password.', '', 'Open', 'password').then(function (pw) {
+          if (!pw) return 'locked';
+          return Folio.Docs.checkLock(r[0].lock, pw).then(function (ok) {
+            if (!ok) { UI.toast('That password is not right.'); return 'locked'; }
+            unlocked[noteId] = true;
+            return begin(r);
+          });
+        });
+      }
+      return begin(r);
+    });
+  }
+
+  function begin(r) {
+    {
       note = r[0];
       var order = note.pageIds || [];
-      pages = r[1].slice().sort(function (a, b) { return order.indexOf(a.id) - order.indexOf(b.id); });
+      // A page from another device that isn't in the order yet goes last rather than first.
+      function rank(p) { var i = order.indexOf(p.id); return i < 0 ? order.length : i; }
+      pages = r[1].slice().sort(function (a, b) { return rank(a) - rank(b); });
       if (!pages.length) {
         pages = [newPage(note.paper || 'lined')];
         dirty.add(pages[0].id);
@@ -1279,6 +2027,9 @@
       hist = []; future = []; sel = null; textEd = null; act = null; zoom = 1;
       touches.clear(); gesture = null;
       dom.title.value = note.title || '';
+      var readOnly = !!(note.shared && !note.shared.canEdit);
+      dom.editor.classList.toggle('readonly', readOnly);
+      dom.title.readOnly = readOnly;
       dom.zoomLabel.hidden = true;
       setStatus('Saved on this device');
       updateUndoButtons();
@@ -1288,7 +2039,7 @@
       buildViews();
       dom.scroller.scrollTop = 0;
       return true;
-    });
+    }
   }
 
   function close() {
@@ -1296,6 +2047,9 @@
     commitText();
     clearSelection();
     cancelMomentum();
+    clearPull();
+    stopRecording();
+    closePlayer();
     var done = flush();
     note = null;
     pages = [];

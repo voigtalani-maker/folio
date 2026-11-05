@@ -38,13 +38,34 @@
     });
   }
 
-  var Store = {
-    all: function (store) { return run(store, 'readonly', function (s) { return s.getAll(); }); },
-    get: function (store, id) { return run(store, 'readonly', function (s) { return s.get(id); }); },
+  var raw = {
     put: function (store, value) { return run(store, 'readwrite', function (s) { return s.put(value); }); },
     del: function (store, id) { return run(store, 'readwrite', function (s) { return s.delete(id); }); },
     putMany: function (store, values) {
       return run(store, 'readwrite', function (s) { values.forEach(function (v) { s.put(v); }); });
+    }
+  };
+  var writeListener = null;
+  function wrote(store, id) {
+    if (writeListener && store !== 'assets') writeListener(store, id);
+  }
+
+  var Store = {
+    raw: raw, // Sync writes through here, so what it receives isn't sent straight back.
+    onWrite: function (fn) { writeListener = fn; },
+    all: function (store) { return run(store, 'readonly', function (s) { return s.getAll(); }); },
+    get: function (store, id) { return run(store, 'readonly', function (s) { return s.get(id); }); },
+    put: function (store, value) {
+      return raw.put(store, value).then(function (r) { wrote(store, value.id); return r; });
+    },
+    del: function (store, id) {
+      return raw.del(store, id).then(function (r) { wrote(store, id); return r; });
+    },
+    putMany: function (store, values) {
+      return raw.putMany(store, values).then(function (r) {
+        values.forEach(function (v) { wrote(store, v.id); });
+        return r;
+      });
     },
     pagesOf: function (noteId) {
       return run('pages', 'readonly', function (s) { return s.index('noteId').getAll(noteId); });
@@ -53,15 +74,18 @@
     purgeNote: function (note) {
       return Store.pagesOf(note.id).then(function (pages) {
         var ids = {};
+        (note.recordings || []).forEach(function (r) { ids[r.asset] = true; });
         pages.forEach(function (p) {
-          p.items.forEach(function (it) { if (it.type === 'image') ids[it.asset] = true; });
+          if (p.bg) ids[p.bg.asset] = true;
+          p.items.forEach(function (it) { if (it.asset) ids[it.asset] = true; });
         });
         return Promise.all(pages.map(function (p) { return Store.del('pages', p.id); }))
           .then(function () { return Store.del('notes', note.id); })
           .then(function () { return Store.all('pages'); })
           .then(function (rest) {
             rest.forEach(function (p) {
-              p.items.forEach(function (it) { if (it.type === 'image') delete ids[it.asset]; });
+              if (p.bg) delete ids[p.bg.asset];
+              p.items.forEach(function (it) { if (it.asset) delete ids[it.asset]; });
             });
             return Promise.all(Object.keys(ids).map(function (id) { return Store.del('assets', id); }));
           });

@@ -34,26 +34,104 @@
     });
   }
 
+  var VIEW_KEY = 'folio.view';
+  var view = { sort: 'updated', since: 0 };
+  try { Object.assign(view, JSON.parse(localStorage.getItem(VIEW_KEY))); } catch (e) { /* defaults apply */ }
+
+  function sinceTime() {
+    var now = new Date();
+    if (view.since === 'today') return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    if (view.since === 'week') return Date.now() - 7 * 86400000;
+    if (view.since === 'month') return Date.now() - 30 * 86400000;
+    return 0;
+  }
+
   function visibleNotes() {
-    var q = query.trim().toLowerCase();
+    var q = query.trim().toLowerCase().replace(/^#/, ''), since = sinceTime();
     var list = notes.filter(function (n) {
       if (scope.kind === 'trash') return !!n.deletedAt;
       if (n.deletedAt) return false;
-      if (q) return (n.title || 'Untitled note').toLowerCase().indexOf(q) >= 0;
+      if ((n.updated || 0) < since) return false;
+      if (q) {
+        return (n.title || 'Untitled note').toLowerCase().indexOf(q) >= 0 ||
+          (n.tags || []).some(function (t) { return t.toLowerCase().indexOf(q) >= 0; }) ||
+          (!n.lock && String(n.searchText || '').toLowerCase().indexOf(q) >= 0);
+      }
       if (scope.kind === 'favourites') return !!n.favourite;
       if (scope.kind === 'folder') return n.folderId === scope.id;
+      if (scope.kind === 'tag') return (n.tags || []).indexOf(scope.tag) >= 0;
       return true;
     });
-    return list.sort(function (a, b) { return (b.updated || 0) - (a.updated || 0); });
+    return list.sort(function (a, b) {
+      if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
+      if (view.sort === 'title') {
+        return (a.title || 'Untitled note').localeCompare(b.title || 'Untitled note', undefined, { numeric: true });
+      }
+      if (view.sort === 'created') return (b.created || 0) - (a.created || 0);
+      return (b.updated || 0) - (a.updated || 0);
+    });
+  }
+
+  function sortAndFilter() {
+    UI.sheet('Sort and filter', [
+      { heading: 'Sort by' },
+      { label: 'Last edited', value: 's:updated', checked: view.sort === 'updated' },
+      { label: 'Date created', value: 's:created', checked: view.sort === 'created' },
+      { label: 'Title', value: 's:title', checked: view.sort === 'title' },
+      { heading: 'Edited' },
+      { label: 'Any time', value: 'f:0', checked: !view.since },
+      { label: 'Today', value: 'f:today', checked: view.since === 'today' },
+      { label: 'Last 7 days', value: 'f:week', checked: view.since === 'week' },
+      { label: 'Last 30 days', value: 'f:month', checked: view.since === 'month' }
+    ]).then(function (v) {
+      if (!v) return;
+      if (v[0] === 's') view.sort = v.slice(2);
+      else view.since = v === 'f:0' ? 0 : v.slice(2);
+      try { localStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch (e) { /* not essential */ }
+      renderGrid();
+    });
+  }
+
+  function editTags(n) {
+    UI.prompt('Tags, separated by commas', (n.tags || []).join(', '), 'Save tags').then(function (txt) {
+      if (txt === null && !(n.tags || []).length) return;
+      var seen = {};
+      n.tags = String(txt || '').split(',').map(function (t) { return t.trim().replace(/^#/, ''); }).filter(function (t) {
+        if (!t || seen[t.toLowerCase()]) return false;
+        seen[t.toLowerCase()] = true;
+        return true;
+      });
+      Store.put('notes', n).then(refresh);
+    });
+  }
+
+  function allTags() {
+    var seen = {};
+    notes.forEach(function (n) {
+      if (!n.deletedAt) (n.tags || []).forEach(function (t) { seen[t] = (seen[t] || 0) + 1; });
+    });
+    return Object.keys(seen).sort().map(function (t) { return [t, seen[t]]; });
   }
 
   // ---------- Actions ----------
 
+  var FORMAT_KEY = 'folio.lastFormat';
+
   function newNote() {
+    var last = 'lined';
+    try { last = localStorage.getItem(FORMAT_KEY) || last; } catch (e) { /* lined is fine */ }
+    UI.formatPicker('Choose a format', last).then(function (format) {
+      if (!format) return;
+      try { localStorage.setItem(FORMAT_KEY, format); } catch (e) { /* not essential */ }
+      createNote(format);
+    });
+  }
+
+  function createNote(format) {
     var now = Date.now();
     var note = {
       id: Ink.uid(), title: '', folderId: scope.kind === 'folder' ? scope.id : null,
-      paper: 'lined', favourite: false, created: now, updated: now, pageIds: []
+      paper: format, favourite: false, created: now, updated: now, pageIds: []
     };
     var page = { id: Ink.uid(), noteId: note.id, paper: note.paper, items: [] };
     note.pageIds = [page.id];
@@ -74,10 +152,17 @@
     UI.sheet(f.name, [
       { label: 'New folder inside', icon: 'plus', value: 'sub' },
       { label: 'Rename', icon: 'pen', value: 'rename' },
+      { label: 'Colour', icon: 'shape', value: 'colour' },
       { label: 'Delete folder', icon: 'trash', value: 'delete', danger: true }
     ]).then(function (v) {
       if (v === 'sub') addFolder(f.id);
-      else if (v === 'rename') {
+      else if (v === 'colour') {
+        UI.colorWheel(f.color || spineColor(f.id), SPINES).then(function (c) {
+          if (!c) return;
+          f.color = c;
+          Store.put('folders', f).then(refresh);
+        });
+      } else if (v === 'rename') {
         UI.prompt('Rename folder', f.name).then(function (name) {
           if (!name) return;
           f.name = name;
@@ -111,11 +196,19 @@
     }
     UI.sheet(n.title || 'Untitled note', [
       { label: n.favourite ? 'Remove from favourites' : 'Add to favourites', icon: 'star', value: 'fav' },
+      { label: n.pinned ? 'Unpin' : 'Pin to top', icon: 'pin', value: 'pin' },
+      { label: 'Tags', icon: 'tag', value: 'tags' },
+      n.shared ? null : { label: 'Share', icon: 'share', value: 'share' },
+      { label: n.lock ? 'Remove password' : 'Lock with password', icon: 'lock', value: 'lock' },
       { label: 'Rename', icon: 'pen', value: 'rename' },
       { label: 'Move to folder', icon: 'folder', value: 'move' },
       { label: 'Move to recycle bin', icon: 'trash', value: 'delete', danger: true }
-    ]).then(function (v) {
-      if (v === 'fav') { n.favourite = !n.favourite; Store.put('notes', n).then(refresh); }
+    ].filter(Boolean)).then(function (v) {
+      if (v === 'share') shareNote(n);
+      else if (v === 'fav') { n.favourite = !n.favourite; Store.put('notes', n).then(refresh); }
+      else if (v === 'pin') { n.pinned = !n.pinned; Store.put('notes', n).then(refresh); }
+      else if (v === 'tags') editTags(n);
+      else if (v === 'lock') lockNote(n);
       else if (v === 'rename') {
         UI.prompt('Rename note', n.title || '').then(function (name) {
           if (!name) return;
@@ -128,6 +221,130 @@
         Store.put('notes', n).then(function () { UI.toast('Moved to the recycle bin.'); refresh(); });
       }
     });
+  }
+
+  function lockNote(n) {
+    if (n.lock) {
+      UI.prompt('Enter the password to remove it', '', 'Remove', 'password').then(function (pw) {
+        if (!pw) return;
+        Folio.Docs.checkLock(n.lock, pw).then(function (ok) {
+          if (!ok) { UI.toast('That password is not right.'); return; }
+          delete n.lock;
+          Store.put('notes', n).then(refresh);
+        });
+      });
+      return;
+    }
+    UI.prompt('Choose a password for this note', '', 'Next', 'password').then(function (pw) {
+      if (!pw) return;
+      UI.prompt('Type it again', '', 'Lock note', 'password').then(function (again) {
+        if (again === null) return;
+        if (again !== pw) { UI.toast('The passwords did not match.'); return; }
+        UI.confirm('Lock this note?', 'If you forget this password, Folio can\'t get the note back through the app. The lock hides the note in Folio, but it does not encrypt it, and backups can still contain it.', 'Lock note').then(function (ok) {
+          if (!ok) return;
+          Folio.Docs.makeLock(pw).then(function (lock) {
+            n.lock = lock;
+            return Store.put('notes', n);
+          }).then(refresh);
+        });
+      });
+    });
+  }
+
+  function chooseFiles() {
+    var input = el('input', { type: 'file', multiple: true });
+    input.addEventListener('change', function () {
+      if (input.files.length) Folio.openFiles(Array.from(input.files));
+    });
+    input.click();
+  }
+
+  // ---------- Account and sharing ----------
+
+  function syncText() {
+    var s = Folio.Sync.state();
+    if (s.error) return 'Sync problem. It will retry.';
+    if (s.busy) return 'Syncing…';
+    if (s.pending) return s.pending + ' change' + (s.pending === 1 ? '' : 's') + ' waiting to sync';
+    return s.lastSync ? 'Synced ' + UI.timeAgo(s.lastSync).toLowerCase() : 'Ready to sync';
+  }
+
+  function accountPanel() {
+    var user = Folio.Sync.user();
+    if (!user) {
+      return el('div', null,
+        el('p.side-hint', { text: 'Your notes are saved only on this device. Sign in to sync them.' }),
+        el('div.side-actions', null, el('button.btn.small', { type: 'button', text: 'Sign in to sync', on: { click: signInDialog } })));
+    }
+    var status = el('span', { id: 'syncStatus', text: syncText() });
+    return el('div', null,
+      el('div.account', null, el('strong', { text: user.email }), status),
+      el('div.side-actions', null, el('button.btn.small', {
+        type: 'button', text: 'Sign out', on: { click: function () {
+          UI.confirm('Sign out?', 'Your notes stay on this device, but stop syncing until you sign back in.', 'Sign out').then(function (ok) {
+            if (ok) { Folio.Sync.signOut(); render(); }
+          });
+        } }
+      })));
+  }
+
+  function signInDialog() {
+    UI.showDialog(function (dlg, done) {
+      var email = el('input.field', { type: 'email', autocomplete: 'email', 'aria-label': 'Email', placeholder: 'Email' });
+      var password = el('input.field', { type: 'password', autocomplete: 'current-password', 'aria-label': 'Password', placeholder: 'Password', minlength: 8 });
+      var message = el('p', { role: 'status' });
+      function attempt(create) {
+        if (!email.value.trim() || !password.value) { message.textContent = 'Enter your email and a password.'; return; }
+        message.textContent = create ? 'Creating your account…' : 'Signing in…';
+        var action = create ? Folio.Sync.signUp(email.value.trim(), password.value) : Folio.Sync.signIn(email.value.trim(), password.value).then(function () { return true; });
+        action.then(function (ready) {
+          if (ready) { done(true); render(); return; }
+          message.textContent = 'Check your email for a confirmation link, then come back and sign in.';
+        }).catch(function (err) { message.textContent = err.message; });
+      }
+      dlg.appendChild(el('form.dlg-body', { on: { submit: function (e) { e.preventDefault(); attempt(false); } } },
+        el('h2', { text: 'Sync your notes' }),
+        el('p', { text: 'Use the same account on your tablet, laptop and phone. Pick a new password just for Folio.' }),
+        email, password, message,
+        el('div.dlg-actions', null,
+          el('button.btn', { type: 'button', text: 'Cancel', on: { click: function () { done(null); } } }),
+          el('button.btn', { type: 'button', text: 'Create account', on: { click: function () { attempt(true); } } }),
+          el('button.btn.primary', { type: 'submit', text: 'Sign in' }))));
+      setTimeout(function () { email.focus(); }, 30);
+    });
+  }
+
+  function showLink(link, canEdit) {
+    UI.showDialog(function (dlg, done) {
+      var field = el('input.field.link-field', { type: 'text', readonly: true, 'aria-label': 'Share link' });
+      field.value = link;
+      dlg.appendChild(el('div.dlg-body', null,
+        el('h2', { text: 'Your share link' }),
+        el('p', { text: (canEdit ? 'Anyone with this link can read and edit this note.' : 'Anyone with this link can read this note.') + ' They don\'t need an account. Images, PDFs and recordings aren\'t included.' }),
+        field,
+        el('div.dlg-actions', null,
+          el('button.btn', { type: 'button', text: 'Close', on: { click: function () { done(null); } } }),
+          el('button.btn.primary', { type: 'button', text: 'Copy link', on: { click: function () {
+            navigator.clipboard.writeText(link).then(function () { UI.toast('Link copied.'); }, function () { field.select(); UI.toast('Press and hold the link to copy it.'); });
+          } } }))));
+    });
+  }
+
+  function shareNote(n) {
+    if (!Folio.Sync.user()) { UI.toast('Sign in to share notes.'); signInDialog(); return; }
+    if (n.lock) { UI.toast('Remove the note\'s password before sharing it.'); return; }
+    Folio.Sync.sharesOf(n.id).then(function (shares) {
+      var options = [
+        { label: 'Anyone with the link can read', value: 'view' },
+        { label: 'Anyone with the link can edit', value: 'edit' }
+      ];
+      if (shares.length) options.push({ label: 'Stop sharing', hint: shares.length + ' active link' + (shares.length === 1 ? '' : 's'), value: 'stop', danger: true });
+      return UI.sheet('Share this note', options).then(function (v) {
+        if (v === 'stop') return Folio.Sync.stopSharing(n.id).then(function () { UI.toast('Those links no longer work.'); });
+        if (!v) return null;
+        return Folio.Sync.createShare(n.id, v === 'edit').then(function (link) { showLink(link, v === 'edit'); });
+      });
+    }).catch(function () { UI.toast('Sharing needs an internet connection.'); });
   }
 
   function moveNote(n) {
@@ -198,7 +415,7 @@
         style: 'padding-left:' + (6 + depth * 14) + 'px'
       },
         el('a.tree-link', { href: '#/f/' + f.id },
-          el('span.nav-ic', { html: icon('folder') }),
+          el('span.nav-ic', { html: icon('folder'), style: f.color ? 'color:' + f.color : null }),
           el('span.nav-label', { text: f.name }),
           count ? el('span.nav-count', { text: String(count) }) : null),
         el('button.tree-more', {
@@ -210,9 +427,11 @@
   }
 
   // Every module gets its own notebook colour, worked out from its folder so it never changes.
-  var SPINES = ['#2f6f5e', '#b4563b', '#3c6696', '#83639f', '#b0822f', '#55794a', '#a44c6d', '#3f7f8c'];
+  var SPINES = ['#6b4630', '#5b9bc4', '#96643f', '#3f7ea6', '#b58a64', '#86b9d6', '#4c3326', '#2f6a8f'];
   function spineColor(folderId) {
-    if (!folderId) return '#9ba59b';
+    if (!folderId) return '#b9a999';
+    var folder = folders.find(function (f) { return f.id === folderId; });
+    if (folder && folder.color) return folder.color;
     var h = 0;
     for (var i = 0; i < folderId.length; i++) h = (h * 31 + folderId.charCodeAt(i)) >>> 0;
     return SPINES[h % SPINES.length];
@@ -225,11 +444,16 @@
     var open = n.deletedAt ? function () { noteMenu(n); } : function () { location.hash = '#/n/' + n.id; };
     return el('article.card', null,
       el('button.card-open', { type: 'button', style: '--spine:' + spineColor(n.folderId), 'aria-label': 'Open ' + (n.title || 'Untitled note'), on: { click: open } },
-        n.thumb ? el('img.card-thumb', { src: n.thumb, alt: '' }) : el('div.card-thumb.empty')),
+        n.lock ? el('div.card-thumb.locked', { html: icon('lock') })
+          : n.thumb ? el('img.card-thumb', { src: n.thumb, alt: '' }) : el('div.card-thumb.empty')),
       el('div.card-info', null,
         el('div.card-text', null,
           el('h3', { text: n.title || 'Untitled note' }),
-          el('p', { text: n.folderId && (query || scope.kind !== 'folder') ? folderPath(n.folderId) || meta : meta })),
+          el('p', { text: n.folderId && (query || scope.kind !== 'folder') ? folderPath(n.folderId) || meta : meta }),
+          (n.tags || []).length ? el.apply(null, ['div.card-tags', null].concat(n.tags.slice(0, 3).map(function (t) {
+            return el('span.tag-chip', { text: '#' + t });
+          }))) : null),
+        n.pinned ? el('span.card-pin', { html: icon('pin'), title: 'Pinned' }) : null,
         n.favourite ? el('span.card-star', { html: icon('star'), title: 'Favourite' }) : null,
         el('button.icon-btn', {
           type: 'button', 'aria-label': 'Options for ' + (n.title || 'Untitled note'), html: icon('more'),
@@ -241,12 +465,14 @@
     if (query.trim()) return 'Search results';
     if (scope.kind === 'favourites') return 'Favourites';
     if (scope.kind === 'trash') return 'Recycle bin';
+    if (scope.kind === 'tag') return '#' + scope.tag;
     if (scope.kind === 'folder') return folderPath(scope.id) || 'Folder';
     return 'All notes';
   }
 
   function emptyState() {
-    if (query.trim()) return el('div.empty', null, el('h3', { text: 'No matching notes' }), el('p', { text: 'Search looks at note titles for now.' }));
+    if (query.trim()) return el('div.empty', null, el('h3', { text: 'No matching notes' }), el('p', { text: 'Search covers titles, tags, typed text and PDF text, but not handwriting.' }));
+    if (view.since) return el('div.empty', null, el('h3', { text: 'No notes in this date range' }), el('p', { text: 'Change it under Sort and filter.' }));
     if (scope.kind === 'trash') return el('div.empty', null, el('h3', { text: 'The recycle bin is empty' }));
     if (scope.kind === 'favourites') return el('div.empty', null, el('h3', { text: 'No favourites yet' }), el('p', { text: 'Open a note\'s options to add it here.' }));
     return el('div.empty', null,
@@ -279,15 +505,22 @@
     var tree = el('div.tree');
     renderTree(null, 0, tree);
     if (!folders.length) tree.appendChild(el('p.side-hint', { text: 'Add a year, then modules and topics inside it.' }));
+    var tags = allTags();
+    if (tags.length) {
+      tree.appendChild(el('div.side-heading', null, el('span', { text: 'Tags' })));
+      tags.forEach(function (t) {
+        tree.appendChild(navItem('#' + t[0], 'tag', '#/t/' + encodeURIComponent(t[0]), scope.kind === 'tag' && scope.tag === t[0], t[1]));
+      });
+    }
     nav.appendChild(tree);
     nav.appendChild(el('div.side-foot', null,
       navItem('Recycle bin', 'trash', '#/trash', scope.kind === 'trash', notes.length - live.length),
-      el('p.side-hint', { text: 'Your notes are saved only on this device. Back up regularly.' }),
+      accountPanel(),
       el('div.side-actions', null,
         el('button.btn.small', { type: 'button', text: 'Back up', on: { click: backup } }),
         el('button.btn.small', { type: 'button', text: 'Restore', on: { click: restore } }))));
 
-    var search = el('input.field.search', { type: 'search', placeholder: 'Search note titles', 'aria-label': 'Search note titles' });
+    var search = el('input.field.search', { type: 'search', placeholder: 'Search your notes', 'aria-label': 'Search your notes' });
     search.value = query;
     search.addEventListener('input', function () { query = search.value; renderGrid(); });
 
@@ -299,6 +532,10 @@
         }),
         el('div.lib-titles', null, el('h1', { id: 'libTitle' }), el('p.lib-sub', { id: 'libSub' })),
         el('div.lib-search', null, el('span.search-ic', { html: icon('search') }), search),
+        el('button.icon-btn', {
+          type: 'button', title: 'Sort and filter', 'aria-label': 'Sort and filter', html: icon('sliders'), on: { click: sortAndFilter }
+        }),
+        scope.kind === 'trash' ? null : el('button.btn', { type: 'button', text: 'Open file', on: { click: chooseFiles } }),
         scope.kind === 'trash' ? null : el('button.btn.primary.new-note', {
           type: 'button', html: icon('plus') + '<span>New note</span>', on: { click: newNote }
         })),
@@ -317,5 +554,15 @@
   }
 
   window.Folio = window.Folio || {};
-  window.Folio.Library = { show: show };
+  window.addEventListener('folio:synced', function () {
+    var lib = document.getElementById('library');
+    var typing = document.activeElement && document.activeElement.matches('.search');
+    if (lib && !lib.hidden && !typing && !document.querySelector('dialog[open]')) refresh();
+  });
+  Folio.Sync.subscribe(function () {
+    var s = document.getElementById('syncStatus');
+    if (s) s.textContent = syncText();
+  });
+
+  window.Folio.Library = { show: show, newNote: newNote };
 })();

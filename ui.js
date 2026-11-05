@@ -25,6 +25,20 @@
     copy: '<rect x="9" y="9" width="11" height="11" rx="1.500"/><path d="M5 15H4V4h11v1"/>',
     up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
     down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
+    fountain: '<path d="M12 21v-7"/><path d="M12 14a1.500 1.500 0 1 0 0-3 1.500 1.500 0 0 0 0 3z"/><path d="M7 11l5-8 5 8-2.500 7h-5z"/>',
+    brush: '<path d="M20.500 3.500c-4 1.500-8 5-10.500 8.500l2.500 2.500c3.500-2.500 7-6.500 8-11z"/><path d="M10 12c-2.500.500-3.500 2-4 4-.300 1.200-1 2-2.500 2.500 2.500 1.500 8 1.500 9-4z"/>',
+    dropper: '<path d="M14 6l4 4"/><path d="M12.500 7.500l4 4L8 20H4v-4z"/><path d="M15 5l1.500-1.500a2.100 2.100 0 0 1 3 0l1 1a2.100 2.100 0 0 1 0 3L19 9"/>',
+    clip: '<rect x="6" y="5" width="12" height="16" rx="2"/><path d="M9 5a3 3 0 0 1 6 0"/>',
+    sliders: '<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
+    pin: '<path d="M12 16v5"/><path d="M8 3h8l-1 7 3 3v3H6v-3l3-3z"/>',
+    tag: '<path d="M3 12V4h8l10 10-8 8z"/><circle cx="8" cy="9" r="1.300"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>',
+    lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    share: '<circle cx="6" cy="12" r="2.500"/><circle cx="18" cy="6" r="2.500"/><circle cx="18" cy="18" r="2.500"/><path d="M8.300 11l7.400-3.800M8.300 13l7.400 3.800"/>',
+    camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.500"/>',
+    file: '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/>',
+    link: '<path d="M10 14a4 4 0 0 0 6 .500l3-3a4 4 0 0 0-6-6l-1 1"/><path d="M14 10a4 4 0 0 0-6-.500l-3 3a4 4 0 0 0 6 6l1-1"/>',
+    grip: '<circle cx="9" cy="6" r="1.2"/><circle cx="15" cy="6" r="1.2"/><circle cx="9" cy="12" r="1.2"/><circle cx="15" cy="12" r="1.2"/><circle cx="9" cy="18" r="1.2"/><circle cx="15" cy="18" r="1.2"/>',
     rect: '<rect x="4" y="6" width="16" height="12" rx="1"/>',
     ellipse: '<ellipse cx="12" cy="12" rx="9" ry="6.500"/>',
     line: '<path d="M5 19L19 5"/>',
@@ -79,9 +93,10 @@
     });
   }
 
-  function prompt(title, value, okLabel) {
+  function prompt(title, value, okLabel, inputType) {
     return showDialog(function (dlg, done) {
-      var input = el('input.field', { type: 'text', maxlength: 120, 'aria-label': title });
+      var isUrl = inputType === 'url';
+      var input = el('input.field', { type: isUrl ? 'text' : inputType || 'text', inputmode: isUrl ? 'url' : null, autocapitalize: isUrl ? 'off' : null, maxlength: isUrl ? 2000 : 120, 'aria-label': title });
       input.value = value || '';
       dlg.appendChild(el('form.dlg-body', {
         method: 'dialog',
@@ -131,6 +146,127 @@
     });
   }
 
+  // Visual page-format menu. With `scoped`, it also asks whether to use it on every page.
+  // Resolves to a format id, or to {id, all} when scoped.
+  function formatPicker(title, current, scoped) {
+    var Ink = Folio.Ink;
+    return showDialog(function (dlg, done) {
+      var all = false;
+      var grid = el('div.format-grid');
+      Ink.FORMATS.forEach(function (f) {
+        var c = el('canvas');
+        c.width = 200;
+        c.height = Math.round(200 * Ink.PH / Ink.PW);
+        var ctx = c.getContext('2d');
+        ctx.setTransform(c.width / Ink.PW, 0, 0, c.height / Ink.PH, 0, 0);
+        Ink.drawPaper(ctx, f.id, 4);
+        grid.appendChild(el('button.format' + (f.id === current ? '.on' : ''), {
+          type: 'button', 'aria-pressed': String(f.id === current),
+          on: { click: function () { done(scoped ? { id: f.id, all: all } : f.id); } }
+        }, c, el('span', { text: f.name })));
+      });
+      var body = el('div.dlg-body.format-panel', null, el('h2', { text: title }), grid);
+      if (scoped) {
+        var box = el('input', { type: 'checkbox' });
+        box.addEventListener('change', function () { all = box.checked; });
+        body.appendChild(el('label.format-all', null, box, el('span', { text: 'Use on every page in this note' })));
+      }
+      body.appendChild(el('div.dlg-actions', null,
+        el('button.btn', { type: 'button', text: 'Cancel', on: { click: function () { done(null); } } })));
+      dlg.classList.add('wide');
+      dlg.appendChild(body);
+    });
+  }
+
+  function hsvToHex(h, s, v) {
+    function f(n) {
+      var k = (n + h / 60) % 6;
+      var c = v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
+      return ('0' + Math.round(c * 255).toString(16)).slice(-2);
+    }
+    return '#' + f(5) + f(3) + f(1);
+  }
+
+  function hexToHsv(hex) {
+    var n = parseInt(hex.slice(1), 16);
+    var r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+    var max = Math.max(r, g, b), d = max - Math.min(r, g, b), h = 0;
+    if (d) {
+      if (max === r) h = ((g - b) / d + 6) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+    }
+    return { h: h * 60, s: max ? d / max : 0, v: max };
+  }
+
+  // Resolves to a #rrggbb colour, or null if cancelled.
+  function colorWheel(initial, recent) {
+    return showDialog(function (dlg, done) {
+      var hsv = hexToHsv(/^#[0-9a-f]{6}$/i.test(initial) ? initial : '#6b4630');
+      var thumb = el('div.wheel-thumb');
+      var shade = el('div.wheel-shade');
+      var wheel = el('div.wheel', { role: 'application', 'aria-label': 'Colour wheel' }, shade, thumb);
+      var bright = el('input.bright', { type: 'range', min: 0, max: 100, 'aria-label': 'Brightness' });
+      var preview = el('div.wheel-preview');
+      var hex = el('input.field.hex', { type: 'text', maxlength: 7, 'aria-label': 'Colour code', spellcheck: 'false' });
+
+      function current() { return hsvToHex(hsv.h, hsv.s, hsv.v); }
+      function paint(skipHex) {
+        var c = current(), a = (hsv.h - 90) * Math.PI / 180;
+        thumb.style.left = (50 + Math.cos(a) * hsv.s * 50) + '%';
+        thumb.style.top = (50 + Math.sin(a) * hsv.s * 50) + '%';
+        thumb.style.background = c;
+        shade.style.opacity = String(1 - hsv.v);
+        bright.value = String(Math.round(hsv.v * 100));
+        bright.style.setProperty('--full', hsvToHex(hsv.h, hsv.s, 1));
+        preview.style.background = c;
+        if (!skipHex) hex.value = c;
+      }
+      function pick(e) {
+        var r = wheel.getBoundingClientRect();
+        var dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+        hsv.h = (Math.atan2(dy, dx) * 180 / Math.PI + 90 + 360) % 360;
+        hsv.s = Math.min(1, Math.hypot(dx, dy) / (r.width / 2));
+        if (hsv.v < 0.05) hsv.v = 1; // A wheel tap on black should visibly do something.
+        paint();
+      }
+      var dragging = false;
+      wheel.addEventListener('pointerdown', function (e) {
+        dragging = true;
+        try { wheel.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+        pick(e);
+      });
+      wheel.addEventListener('pointermove', function (e) { if (dragging) pick(e); });
+      wheel.addEventListener('pointerup', function () { dragging = false; });
+      wheel.addEventListener('pointercancel', function () { dragging = false; });
+      bright.addEventListener('input', function () { hsv.v = bright.value / 100; paint(); });
+      hex.addEventListener('input', function () {
+        var v = hex.value.trim();
+        if (v && v[0] !== '#') v = '#' + v;
+        if (/^#[0-9a-f]{6}$/i.test(v)) { hsv = hexToHsv(v.toLowerCase()); paint(true); }
+      });
+
+      var row = el('div.recent');
+      (recent || []).forEach(function (c) {
+        row.appendChild(el('button.swatch', {
+          type: 'button', 'aria-label': 'Recent colour ' + c, style: 'background:' + c,
+          on: { click: function () { hsv = hexToHsv(c); paint(); } }
+        }));
+      });
+
+      dlg.appendChild(el('div.dlg-body.wheel-panel', null,
+        el('h2', { text: 'Choose a colour' }),
+        wheel,
+        el('label.bright-row', null, el('span', { text: 'Brightness' }), bright),
+        el('div.wheel-row', null, preview, hex),
+        recent && recent.length ? row : null,
+        el('div.dlg-actions', null,
+          el('button.btn', { type: 'button', text: 'Cancel', on: { click: function () { done(null); } } }),
+          el('button.btn.primary', { type: 'button', text: 'Use colour', on: { click: function () { done(current()); } } }))));
+      paint();
+    });
+  }
+
   var toastTimer;
   function toast(message) {
     var t = document.getElementById('toast');
@@ -152,6 +288,7 @@
   window.Folio = window.Folio || {};
   window.Folio.UI = {
     icon: icon, el: el, showDialog: showDialog, prompt: prompt, confirm: confirm, sheet: sheet,
+    formatPicker: formatPicker, colorWheel: colorWheel,
     toast: toast, timeAgo: timeAgo
   };
 })();
