@@ -41,7 +41,7 @@
   var dirty = new Set(), noteDirty = false, saveTimer = 0, zoomTimer = 0, clearTimer = 0, pullTimer = 0;
   var live = null, liveCtx = null, liveOwner = null, liveLowLatency = false, rafPending = false;
   var INK_TOOLS = ['pen', 'fountain', 'brush', 'pencil', 'highlighter'];
-  var dropping = false, clipboard = [];
+  var dropping = false, clipboard = [], penButtonSeen = false;
   var rec = null, player = null, recTimer = 0;
   var stats = { type: '-', pMin: 1, pMax: 0, events: 0, coalesced: 0, frames: 0, start: 0, end: 0 };
   var dom = {}, unlocked = {};
@@ -319,7 +319,10 @@
     return node ? views.get(node.dataset.id) : null;
   }
 
-  function isEraserButton(e) { return e.pointerType === 'pen' && (e.button === 5 || (e.buttons & 32)); }
+  // The pen's side button (2) or an eraser end (5, 32) erases while held.
+  function isEraserButton(e) {
+    return e.pointerType === 'pen' && (e.button === 2 || e.button === 5 || (e.buttons & 2) !== 0 || (e.buttons & 32) !== 0);
+  }
 
   function onPointerDown(e) {
     var t = e.target;
@@ -363,21 +366,24 @@
 
     if (dropping) {
       act = Object.assign(base, { kind: 'dropper', point: p });
-    } else if (INK_TOOLS.indexOf(tool) >= 0) {
+    } else if (INK_TOOLS.indexOf(tool) >= 0 || (tool === 'shape' && cfg.shape === 'curve')) {
       prepareLive(v, e.pointerType);
       live.classList.toggle('multiply', tool === 'highlighter');
-      var opts = cfg.t[tool];
+      var opts = cfg.t[tool], autoCurve = tool === 'shape';
+      if (autoCurve) tool = 'pen';
       act = Object.assign(base, {
-        kind: 'ink', drawn: 1, smoothP: null,
+        kind: 'ink', drawn: 1, smoothP: null, autoCurve: autoCurve,
         item: { id: Ink.uid(), type: 'stroke', tool: tool, color: opts.color, width: opts.width, pts: [] }
       });
       resetStats(e);
       addInkPoint(e, rect);
       paintLive();
+      act.anchor = p;
+      armHold();
     } else if (tool === 'eraser') {
       prepareLive(v, e.pointerType);
       live.classList.remove('multiply');
-      act = Object.assign(base, { kind: 'erase', radius: cfg.t.eraser.width / 2, last: p });
+      act = Object.assign(base, { kind: 'erase', radius: cfg.t.eraser.width / 2, last: p, viaButton: tool !== cfg.tool });
       eraseAt(p);
       drawEraserRing(p);
     } else if (tool === 'lasso') {
@@ -422,6 +428,35 @@
     it.pts.push(+x.toFixed(2), +y.toFixed(2), +act.smoothP.toFixed(3));
   }
 
+  // Draw a shape and keep the pen still: it turns into a neat shape, the size you drew it.
+  var HOLD_MS = 550, holdTimer = 0;
+
+  function armHold() {
+    clearTimeout(holdTimer);
+    holdTimer = setTimeout(snapToShape, HOLD_MS);
+  }
+
+  function snapToShape() {
+    if (!act || act.kind !== 'ink' || act.snapped) return;
+    var it = act.item, neat = Ink.recognizeShape(it.pts, { curves: true, force: act.autoCurve });
+    if (!neat) return;
+    if (it.tool === 'highlighter') {
+      var track = neat.shape === 'line' ? [neat.x1, neat.y1, neat.x2, neat.y2]
+        : neat.shape === 'curve' ? Ink.curvePoints(neat.points)
+          : neat.shape === 'poly' ? neat.points.concat(neat.open ? [] : neat.points.slice(0, 2))
+            : Ink.curvePoints(Ink.outlineOf(neat)), flat = [];
+      for (var f = 0; f < track.length; f += 2) flat.push(track[f], track[f + 1], 0.5);
+      act.snapped = Object.assign({}, it, { pts: flat });
+      clearLive();
+      Ink.drawHighlighter(liveCtx, act.snapped);
+    } else {
+      act.snapped = Object.assign({ id: it.id, type: 'shape', color: it.color, width: it.width }, neat);
+      clearLive();
+      Ink.drawShape(liveCtx, act.snapped);
+    }
+    if (navigator.vibrate) navigator.vibrate(12);
+  }
+
   function paintLive() {
     var it = act.item;
     if (it.tool === 'highlighter') {
@@ -438,7 +473,11 @@
   }
 
   function onPointerMove(e) {
-    if (e.pointerType === 'pen') lastPen = performance.now();
+    if (e.pointerType === 'pen') {
+      lastPen = performance.now();
+      if (e.buttons & 34) penButtonSeen = true;
+      switchWithButton(e);
+    }
     if (e.type === 'pointerrawupdate') seenRaw = true;
     else if (seenRaw && act && act.kind === 'ink') return;
 
@@ -452,6 +491,21 @@
     if (!list.length) list = [e];
 
     if (act.kind === 'ink') {
+      var heldAt = list[list.length - 1], heldPoint = pagePoint(heldAt, act.rect);
+      var movedOn = Math.hypot(heldPoint.x - act.anchor.x, heldPoint.y - act.anchor.y) > 5;
+      if (act.snapped) {
+        // It was only a pause: back to the hand-drawn stroke, and keep drawing.
+        if (!movedOn) return;
+        act.snapped = null;
+        clearLive();
+        if (act.item.tool === 'highlighter') Ink.drawHighlighter(liveCtx, act.item);
+        else Ink.drawInk(liveCtx, act.item, 1);
+        act.drawn = act.item.pts.length / 3;
+      }
+      if (movedOn) {
+        act.anchor = heldPoint;
+        armHold();
+      }
       stats.events++;
       stats.coalesced += list.length;
       stats.end = performance.now();
@@ -486,6 +540,20 @@
       });
     } else if (act.kind === 'seldrag') {
       moveSelectionDrag(e);
+    }
+  }
+
+  // Pressing or letting go of the side button in the middle of a stroke swaps tools straight away.
+  function switchWithButton(e) {
+    if (!act || e.pointerId !== act.pointerId || !e.buttons) return;
+    var held = isEraserButton(e);
+    if (held && act.kind === 'ink') {
+      finishAction();
+      startAction(e);
+      if (act) act.viaButton = true;
+    } else if (!held && act.kind === 'erase' && act.viaButton) {
+      finishAction();
+      startAction(e);
     }
   }
 
@@ -546,11 +614,15 @@
   function finishAction() {
     var a = act;
     act = null;
+    clearTimeout(holdTimer);
     var page = a.v.page;
     if (a.kind === 'ink') {
       if (!a.item.pts.length) { clearLiveSoon(); return; }
-      var finished = a.item;
-      if (cfg.shapeFix && finished.tool !== 'highlighter') {
+      var finished = a.snapped || a.item;
+      if (a.autoCurve && !a.snapped) {
+        var drawnCurve = Ink.recognizeShape(finished.pts, { force: true });
+        if (drawnCurve) finished = Object.assign({ id: finished.id, type: 'shape', color: finished.color, width: finished.width }, drawnCurve);
+      } else if (!a.snapped && cfg.shapeFix && finished.tool !== 'highlighter') {
         var neat = Ink.recognizeShape(finished.pts);
         if (neat) {
           finished = Object.assign({ id: finished.id, type: 'shape', color: finished.color, width: finished.width }, neat);
@@ -1484,7 +1556,7 @@
     var tool = cfg.tool;
     if (tool === 'shape') {
       var shapes = el('div.tool-group');
-      [['rect', 'Rectangle'], ['ellipse', 'Circle'], ['line', 'Line'], ['arrow', 'Arrow']].forEach(function (s) {
+      [['rect', 'Rectangle'], ['ellipse', 'Circle'], ['line', 'Line'], ['curve', 'Curve'], ['arrow', 'Arrow']].forEach(function (s) {
         shapes.appendChild(el('button.tool' + (cfg.shape === s[0] ? '.on' : ''), {
           type: 'button', title: s[1], 'aria-label': s[1], html: icon(s[0]),
           on: { click: function () { cfg.shape = s[0]; saveSettings(); buildToolbar(); } }
@@ -1639,7 +1711,27 @@
       });
     });
     show();
-    return el('div.tool-group.size-group', null, preview, slider, value);
+    // Fine steps at pen sizes, bigger ones for broad tools.
+    function nudge(direction) {
+      var step = opts.width < 5 ? 0.5 : opts.width < 20 ? 1 : 2;
+      opts.width = Math.max(min, Math.min(max, Math.round((opts.width + direction * step) * 10) / 10));
+      slider.value = String(toSlider(opts.width));
+      saveSettings();
+      show();
+    }
+    function stepButton(label, title, direction) {
+      var hold = 0, repeat = 0;
+      function stop() { clearTimeout(hold); clearInterval(repeat); }
+      var b = el('button.size-step', { type: 'button', title: title, 'aria-label': title, text: label });
+      // A tap moves one step; holding keeps going.
+      b.addEventListener('pointerdown', function () {
+        nudge(direction);
+        hold = setTimeout(function () { repeat = setInterval(function () { nudge(direction); }, 90); }, 400);
+      });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach(function (ev) { b.addEventListener(ev, stop); });
+      return b;
+    }
+    return el('div.tool-group.size-group', null, preview, stepButton('−', 'Smaller', -1), slider, stepButton('+', 'Bigger', 1), value);
   }
 
   // ---------- Movable toolbar ----------
@@ -1905,6 +1997,7 @@
       ['Pressure range', stats.type === 'pen' ? stats.pMin.toFixed(2) + ' to ' + stats.pMax.toFixed(2) : 'Not a pen stroke'],
       ['Pen samples per second', hasStroke ? String(Math.round(stats.coalesced / secs)) : '-'],
       ['Screen updates per second', hasStroke ? String(Math.round(stats.events / secs)) : '-'],
+      ['Pen side button', penButtonSeen ? 'Detected' : 'Not detected yet'],
       ['Low-latency canvas', low ? 'Active' : 'Not active'],
       ['Fast input events', 'onpointerrawupdate' in window ? 'Available' : 'Not available']
     ];

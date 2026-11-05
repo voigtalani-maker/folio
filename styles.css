@@ -232,6 +232,9 @@ h1, h2, h3, p { margin: 0; }
   position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 7; padding: 10px 18px; white-space: nowrap;
   border-radius: 999px; background: var(--rail); color: var(--rail-ink); box-shadow: var(--float); pointer-events: none;
 }
+.size-step { flex: none; width: 34px; height: 44px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 10px; background: transparent; font-size: 22px; line-height: 1; font-weight: 600; touch-action: none; user-select: none; -webkit-user-select: none; }
+.size-step:hover { background: var(--surface-2); }
+.dock.vertical .size-group { flex-wrap: nowrap; }
 .size-slider { width: 80px; height: 44px; margin: 0; accent-color: var(--accent); touch-action: none; cursor: pointer; }
 .size-value { flex: none; min-width: 44px; height: 44px; padding: 0 4px; border: 0; border-radius: 10px; background: transparent; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .size-value:hover { background: var(--surface-2); }

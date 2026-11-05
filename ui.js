@@ -42,6 +42,7 @@
     rect: '<rect x="4" y="6" width="16" height="12" rx="1"/>',
     ellipse: '<ellipse cx="12" cy="12" rx="9" ry="6.500"/>',
     line: '<path d="M5 19L19 5"/>',
+    curve: '<path d="M4 18C8 4 16 20 20 6"/>',
     arrow: '<path d="M5 19L19 5"/><path d="M10 5h9v9"/>'
   };
 
