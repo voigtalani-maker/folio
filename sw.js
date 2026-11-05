@@ -1,5 +1,5 @@
 // Network first, so updates arrive straight away; the cached copy keeps Folio working offline.
-var CACHE = 'folio-v4';
+var CACHE = 'folio-v5';
 var SHELL = [
   './', 'index.html', 'styles.css', 'store.js', 'ink.js', 'ui.js', 'docs.js', 'sync.js', 'editor.js', 'library.js', 'app.js',
   'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'

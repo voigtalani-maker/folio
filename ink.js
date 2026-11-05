@@ -472,7 +472,7 @@
   // ---------- Formatted text ----------
   // Formatted notes are kept as a small, safe subset of HTML and drawn onto the page by hand.
 
-  var ALLOWED = { B: 1, STRONG: 1, I: 1, EM: 1, U: 1, FONT: 1, DIV: 1, P: 1, BR: 1, UL: 1, OL: 1, LI: 1, TABLE: 1, TBODY: 1, TR: 1, TD: 1 };
+  var ALLOWED = { B: 1, STRONG: 1, I: 1, EM: 1, U: 1, FONT: 1, DIV: 1, P: 1, BR: 1, UL: 1, OL: 1, LI: 1, BLOCKQUOTE: 1, TABLE: 1, TBODY: 1, TR: 1, TD: 1 };
   var DROPPED = { SCRIPT: 1, STYLE: 1, IFRAME: 1, OBJECT: 1, EMBED: 1, SVG: 1, MATH: 1, LINK: 1, META: 1 };
   var FONT_SCALE = { 1: 0.7, 2: 0.85, 3: 1, 4: 1.2, 5: 1.5, 6: 2, 7: 2.6 };
 
@@ -499,6 +499,23 @@
     return out.innerHTML;
   }
 
+  // Browsers nest a sub-list either inside a list item or straight inside the parent list.
+  function collectList(listNode, st, list, indent, state) {
+    var n = 0, marker = indent > 1 ? '◦' : '•';
+    Array.prototype.forEach.call(listNode.children, function (child) {
+      if (child.tagName === 'UL' || child.tagName === 'OL') {
+        state.cur = null;
+        collectList(child, st, list, indent + 1, state);
+        state.cur = null;
+        return;
+      }
+      n++;
+      state.cur = { runs: [], indent: indent, prefix: listNode.tagName === 'OL' ? n + '.' : marker };
+      list.push(state.cur);
+      collectBlocks(child, st, list, indent, state);
+      state.cur = null;
+    });
+  }
   function collectBlocks(node, st, list, indent, state) {
     Array.prototype.forEach.call(node.childNodes, function (child) {
       if (child.nodeType === 3) {
@@ -527,16 +544,14 @@
         state.cur = null;
         collectBlocks(child, next, list, indent, state);
         state.cur = null;
+      } else if (tag === 'BLOCKQUOTE') {
+        state.cur = null;
+        collectBlocks(child, next, list, indent + 1, state);
+        state.cur = null;
       } else if (tag === 'UL' || tag === 'OL') {
         state.cur = null;
-        var n = 0;
-        Array.prototype.forEach.call(child.children, function (li) {
-          n++;
-          state.cur = { runs: [], indent: indent + 1, prefix: tag === 'OL' ? n + '.' : '•' };
-          list.push(state.cur);
-          collectBlocks(li, next, list, indent + 1, state);
-          state.cur = null;
-        });
+        collectList(child, next, list, indent + 1, state);
+        state.cur = null;
       } else if (tag === 'TABLE') {
         state.cur = null;
         var rows = Array.prototype.map.call(child.querySelectorAll('tr'), function (tr) {
@@ -730,7 +745,12 @@
     } else if (it.type === 'image') {
       var img = assets && assets[it.asset];
       if (img) {
-        ctx.drawImage(img, it.x, it.y, it.w, it.h);
+        if (it.crop) {
+          var iw = img.width, ih = img.height;
+          ctx.drawImage(img, it.crop.x * iw, it.crop.y * ih, it.crop.w * iw, it.crop.h * ih, it.x, it.y, it.w, it.h);
+        } else {
+          ctx.drawImage(img, it.x, it.y, it.w, it.h);
+        }
       } else {
         ctx.save();
         ctx.fillStyle = '#eef1f3';

@@ -38,6 +38,7 @@
     camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.500"/>',
     file: '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/>',
     link: '<path d="M10 14a4 4 0 0 0 6 .500l3-3a4 4 0 0 0-6-6l-1 1"/><path d="M14 10a4 4 0 0 0-6-.500l-3 3a4 4 0 0 0 6 6l1-1"/>',
+    crop: '<path d="M7 2v15h15"/><path d="M2 7h15v15"/>',
     grip: '<circle cx="9" cy="6" r="1.2"/><circle cx="15" cy="6" r="1.2"/><circle cx="9" cy="12" r="1.2"/><circle cx="15" cy="12" r="1.2"/><circle cx="9" cy="18" r="1.2"/><circle cx="15" cy="18" r="1.2"/>',
     rect: '<rect x="4" y="6" width="16" height="12" rx="1"/>',
     ellipse: '<ellipse cx="12" cy="12" rx="9" ry="6.500"/>',

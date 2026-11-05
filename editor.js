@@ -41,7 +41,8 @@
   var dirty = new Set(), noteDirty = false, saveTimer = 0, zoomTimer = 0, clearTimer = 0, pullTimer = 0;
   var live = null, liveCtx = null, liveOwner = null, liveLowLatency = false, rafPending = false;
   var INK_TOOLS = ['pen', 'fountain', 'brush', 'pencil', 'highlighter'];
-  var dropping = false, clipboard = [], penButtonSeen = false;
+  var dropping = false, clipboard = [], penButtonSeen = false, penHoverHeld = false, eraserHeld = false;
+  var pickUpTimer = 0, closedTyping = false;
   var rec = null, player = null, recTimer = 0;
   var stats = { type: '-', pMin: 1, pMax: 0, events: 0, coalesced: 0, frames: 0, start: 0, end: 0 };
   var dom = {}, unlocked = {};
@@ -321,7 +322,9 @@
 
   // The pen's side button (2) or an eraser end (5, 32) erases while held.
   function isEraserButton(e) {
-    return e.pointerType === 'pen' && (e.button === 2 || e.button === 5 || (e.buttons & 2) !== 0 || (e.buttons & 32) !== 0);
+    if (eraserHeld) return true;
+    if (e.pointerType === 'mouse') return e.button === 2 || (e.buttons & 2) !== 0;
+    return e.pointerType === 'pen' && (penHoverHeld || e.button === 2 || e.button === 5 || (e.buttons & 2) !== 0 || (e.buttons & 32) !== 0);
   }
 
   function onPointerDown(e) {
@@ -334,7 +337,7 @@
     if (e.pointerType === 'pen') {
       lastPen = performance.now();
       endGesture();
-    } else if (e.button !== 0) {
+    } else if (e.button !== 0 && e.button !== 2) {
       return;
     }
     startAction(e);
@@ -342,7 +345,7 @@
 
   function startAction(e) {
     if (note.shared && !note.shared.canEdit) return;
-    var t = e.target;
+    var t = e.target, wasTyping = !!textEd;
     commitTextIfOutside(t);
 
     if (sel && t.closest('.sel-box')) {
@@ -400,7 +403,7 @@
       });
     } else if (tool === 'text') {
       // Opens on lift: Android only shows the keyboard from a completed tap.
-      act = Object.assign(base, { kind: 'texttap', point: p });
+      act = Object.assign(base, { kind: 'texttap', point: p, wasTyping: wasTyping });
     }
   }
 
@@ -476,6 +479,8 @@
     if (e.pointerType === 'pen') {
       lastPen = performance.now();
       if (e.buttons & 34) penButtonSeen = true;
+      // Hovering reports no contact: the button state here carries over to the next touch.
+      if (!(e.buttons & 1) && !act) penHoverHeld = (e.buttons & 2) !== 0;
       switchWithButton(e);
     }
     if (e.type === 'pointerrawupdate') seenRaw = true;
@@ -656,7 +661,8 @@
     } else if (a.kind === 'seldrag') {
       if (page.items !== a.before) pushHistory(page, a.before);
     } else if (a.kind === 'texttap') {
-      openTextAt(a.v, a.point);
+      // A tap while typing only finishes that text box.
+      if (!a.wasTyping) openTextAt(a.v, a.point);
     } else if (a.kind === 'dropper') {
       sampleColor(a.v, a.point);
     }
@@ -688,11 +694,18 @@
 
   function onTouchDown(e) {
     if (performance.now() - lastPen < 500 || (act && act.pointerType === 'pen')) return; // Resting palm.
-    e.preventDefault(); // Stops the follow-up mouse events, which would close an open text box.
+    e.preventDefault(); // Stops the follow-up mouse events.
+    // Touching anywhere else finishes typing, and that touch does nothing more.
+    closedTyping = false;
+    if (textEd && !textEd.ta.contains(e.target)) {
+      commitText();
+      closedTyping = true;
+    }
     touches.set(e.pointerId, { x: e.clientX, y: e.clientY, t0: performance.now(), x0: e.clientX, y0: e.clientY, target: e.target });
     capture(e);
 
     if (touches.size === 2) {
+      clearTimeout(pickUpTimer);
       if (act && act.pointerType === 'touch') abortAction();
       startPinch();
       return;
@@ -702,6 +715,7 @@
     if (sel && e.target.closest('.sel-box')) { startAction(e); return; }
     if (cfg.fingerDraw && cfg.tool !== 'text') { startAction(e); return; }
     gesture = { kind: 'pan', vx: 0, vy: 0, lastT: performance.now() };
+    if (!closedTyping) armPickUp(e.pointerId);
   }
 
   function abortAction() {
@@ -777,6 +791,7 @@
   }
 
   function onTouchUp(e) {
+    clearTimeout(pickUpTimer);
     clearPull();
     var tp = touches.get(e.pointerId);
     touches.delete(e.pointerId);
@@ -797,6 +812,7 @@
   }
 
   function onTap(e) {
+    if (closedTyping) { closedTyping = false; return; }
     if (dropping) {
       var dv = pageViewAt(document.elementFromPoint(e.clientX, e.clientY), e.clientX, e.clientY);
       if (dv) {
@@ -808,7 +824,13 @@
     var v = pageViewAt(document.elementFromPoint(e.clientX, e.clientY), e.clientX, e.clientY);
     if (v) {
       if (v.stale) renderView(v);
-      if (tapActions(v, pagePoint(e, v.el.getBoundingClientRect()))) return;
+      var tapPoint = pagePoint(e, v.el.getBoundingClientRect());
+      if (tapActions(v, tapPoint)) return;
+      if (cfg.tool !== 'text') {
+        // A tap selects an image or text box, ready to drag.
+        var tapped = itemAt(v, tapPoint);
+        if (tapped) { setSelection(v, new Set([tapped.id])); return; }
+      }
     }
     if (cfg.tool !== 'text') {
       if (sel) clearSelection();
@@ -876,7 +898,14 @@
 
   function setSelection(v, ids) {
     clearSelection();
+    var only = ids.size === 1 ? v.page.items.find(function (it) { return ids.has(it.id); }) : null;
     var bar = el('div.sel-bar', null,
+      only && only.type === 'image' ? barButton('crop', 'Crop', function () { cropImage(v, currentItem(v, only.id)); }) : null,
+      only && only.type === 'text' ? barButton('text', 'Edit text', function () {
+        var latest = currentItem(v, only.id);
+        clearSelection();
+        startTextEdit(v, latest, latest);
+      }) : null,
       barButton('clip', 'Copy', copySelection),
       barButton('copy', 'Duplicate', duplicateSelection),
       barButton('trash', 'Delete', deleteSelection));
@@ -885,6 +914,11 @@
     v.el.appendChild(box);
     sel = { v: v, ids: ids, box: box };
     positionSelection();
+  }
+
+  // Moving or resizing replaces an item, so always look up its latest version.
+  function currentItem(v, id) {
+    return v.page.items.find(function (it) { return it.id === id; });
   }
 
   function barButton(ic, label, fn) {
@@ -1033,6 +1067,11 @@
     s.width = (item.w / PW * 100) + '%';
     s.font = (item.size * cssWidth() / PW) + 'px/' + Ink.LINE + ' ' + Ink.FONT;
     s.color = item.color;
+    ta.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab') return;
+      e.preventDefault();
+      document.execCommand(e.shiftKey ? 'outdent' : 'indent');
+    });
     // Pasting always comes in as clean text with its line breaks, never as outside formatting.
     ta.addEventListener('paste', function (e) {
       var plain = e.clipboardData && e.clipboardData.getData('text/plain');
@@ -1073,7 +1112,7 @@
     dom.richBar.hidden = true;
     var value = ed.ta.innerText.replace(/\s+$/, '');
     var html = Ink.cleanHtml(ed.ta.innerHTML);
-    var rich = /<(b|i|u|strong|em|font|ul|ol|table)\b/i.test(html);
+    var rich = /<(b|i|u|strong|em|font|ul|ol|table|blockquote)\b/i.test(html);
     ed.ta.remove();
     var page = ed.v.page, before = ed.before;
     var result = Object.assign({}, ed.item, { text: value });
@@ -1117,6 +1156,8 @@
     bar.appendChild(cmd('A+', 'Larger text', exec('fontSize', '5')));
     bar.appendChild(cmd('•', 'Bulleted list', exec('insertUnorderedList')));
     bar.appendChild(cmd('1.', 'Numbered list', exec('insertOrderedList')));
+    bar.appendChild(cmd('⇤', 'Decrease indent', exec('outdent')));
+    bar.appendChild(cmd('⇥', 'Increase indent', exec('indent')));
     bar.appendChild(cmd('☐', 'Checkbox', exec('insertText', '☐ ')));
     bar.appendChild(cmd('▦', 'Insert table', function () {
       var row = '<tr><td><br></td><td><br></td><td><br></td></tr>';
@@ -1548,8 +1589,12 @@
       if (cfg.toolHidden.indexOf(t[0]) >= 0 && cfg.tool !== t[0]) return;
       tools.appendChild(el('button.tool' + (cfg.tool === t[0] ? '.on' : ''), {
         type: 'button', title: t[1], 'aria-label': t[1], 'aria-pressed': String(cfg.tool === t[0]),
-        'data-tool': t[0], html: icon(t[0]), on: { click: function () { setTool(t[0]); } }
+        'data-tool': t[0], html: icon(t[0]), on: { click: function () {
+          if (t[0] === 'eraser' && holdUsed) { holdUsed = false; return; }
+          setTool(t[0]);
+        } }
       }));
+      if (t[0] === 'eraser') bindEraserHold(tools.lastChild);
     });
     bar.appendChild(tools);
 
@@ -1618,6 +1663,141 @@
 
     if (RANGES[tool]) bar.appendChild(sizeControl(tool));
     if (dom.dock) placeDock();
+  }
+
+  // Hold the eraser button with a finger, and the pen erases until you let go. A quick tap still selects it.
+  var holdUsed = false;
+
+  function bindEraserHold(button) {
+    var timer = 0;
+    function release() {
+      clearTimeout(timer);
+      if (eraserHeld) {
+        eraserHeld = false;
+        button.classList.remove('holding');
+        holdUsed = true;
+      }
+    }
+    button.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'pen') return;
+      timer = setTimeout(function () {
+        if (cfg.tool === 'eraser') return;
+        eraserHeld = true;
+        button.classList.add('holding');
+        if (navigator.vibrate) navigator.vibrate(10);
+      }, 200);
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) { button.addEventListener(name, release); });
+    button.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  }
+
+  // ---------- Picking things up with a finger ----------
+
+  // The image or text box under a point, topmost first.
+  function itemAt(v, p) {
+    var items = v.page.items, ctx = measureCtx();
+    for (var i = items.length - 1; i >= 0; i--) {
+      var it = items[i];
+      if (it.type !== 'image' && it.type !== 'text' && it.type !== 'attach') continue;
+      var r = Ink.bbox(it, ctx);
+      if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) return it;
+    }
+    return null;
+  }
+
+  // Press and hold an item to pick it up, then drag it without lifting.
+  function armPickUp(pointerId) {
+    clearTimeout(pickUpTimer);
+    pickUpTimer = setTimeout(function () {
+      var tp = touches.get(pointerId);
+      if (!tp || touches.size !== 1 || !gesture || gesture.kind !== 'pan') return;
+      if (Math.hypot(tp.x - tp.x0, tp.y - tp.y0) > 10) return;
+      var v = pageViewAt(document.elementFromPoint(tp.x, tp.y), tp.x, tp.y);
+      if (!v) return;
+      var e = { pointerId: pointerId, pointerType: 'touch', clientX: tp.x, clientY: tp.y };
+      var it = itemAt(v, pagePoint(e, v.el.getBoundingClientRect()));
+      if (!it) return;
+      setSelection(v, new Set([it.id]));
+      gesture = null;
+      startSelectionDrag(e, false);
+      if (navigator.vibrate) navigator.vibrate(12);
+    }, 400);
+  }
+
+  // ---------- Cropping ----------
+  // Cropping only hides parts of the image, so the full picture can always be brought back.
+
+  function cropImage(v, item) {
+    var bmp = assets[item.asset];
+    if (!bmp) { UI.toast('That image is still loading. Try again in a moment.'); return; }
+    UI.showDialog(function (dlg, done) {
+      var old = item.crop || { x: 0, y: 0, w: 1, h: 1 }, box = Object.assign({}, old), MIN = 0.04;
+      var c = el('canvas.crop-image');
+      c.width = bmp.width;
+      c.height = bmp.height;
+      c.getContext('2d').drawImage(bmp, 0, 0);
+      var frame = el('div.crop-frame');
+      ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].forEach(function (side) {
+        frame.appendChild(el('div.crop-handle.h-' + side, { 'data-side': side }));
+      });
+      var stage = el('div.crop-stage', null, c, frame);
+      stage.style.aspectRatio = bmp.width + ' / ' + bmp.height;
+      stage.style.width = 'min(100%, calc(60dvh * ' + (bmp.width / bmp.height) + '))';
+      function place() {
+        frame.style.left = box.x * 100 + '%';
+        frame.style.top = box.y * 100 + '%';
+        frame.style.width = box.w * 100 + '%';
+        frame.style.height = box.h * 100 + '%';
+      }
+      var drag = null;
+      frame.addEventListener('pointerdown', function (e) {
+        e.preventDefault();
+        var handle = e.target.dataset ? e.target.dataset.side : null;
+        drag = { id: e.pointerId, side: handle || 'move', x: e.clientX, y: e.clientY, from: Object.assign({}, box) };
+        try { frame.setPointerCapture(e.pointerId); } catch (err) { /* synthetic pointer */ }
+      });
+      frame.addEventListener('pointermove', function (e) {
+        if (!drag || e.pointerId !== drag.id) return;
+        var r = stage.getBoundingClientRect(), dx = (e.clientX - drag.x) / r.width, dy = (e.clientY - drag.y) / r.height, f = drag.from;
+        var left = f.x, top = f.y, right = f.x + f.w, bottom = f.y + f.h;
+        if (drag.side === 'move') {
+          box.x = Math.max(0, Math.min(1 - f.w, f.x + dx));
+          box.y = Math.max(0, Math.min(1 - f.h, f.y + dy));
+        } else {
+          if (drag.side.indexOf('w') >= 0) left = Math.max(0, Math.min(right - MIN, f.x + dx));
+          if (drag.side.indexOf('e') >= 0) right = Math.min(1, Math.max(left + MIN, right + dx));
+          if (drag.side.indexOf('n') >= 0) top = Math.max(0, Math.min(bottom - MIN, f.y + dy));
+          if (drag.side.indexOf('s') >= 0) bottom = Math.min(1, Math.max(top + MIN, bottom + dy));
+          box = { x: left, y: top, w: right - left, h: bottom - top };
+        }
+        place();
+      });
+      function endDrag() { drag = null; }
+      frame.addEventListener('pointerup', endDrag);
+      frame.addEventListener('pointercancel', endDrag);
+      place();
+      dlg.classList.add('wide');
+      dlg.appendChild(el('div.dlg-body.crop-panel', null,
+        el('h2', { text: 'Crop image' }),
+        el('p', { text: 'Drag the corners or edges with your finger or pen. Drag the middle to move the crop.' }),
+        stage,
+        el('div.dlg-actions', null,
+          el('button.btn', { type: 'button', text: 'Cancel', on: { click: function () { done(null); } } }),
+          el('button.btn', { type: 'button', text: 'Full image', on: { click: function () { box = { x: 0, y: 0, w: 1, h: 1 }; place(); } } }),
+          el('button.btn.primary', { type: 'button', text: 'Crop', on: { click: function () { done(box); } } }))));
+    }).then(function (box) {
+      if (!box) return;
+      var page = v.page, before = page.items, old = item.crop || { x: 0, y: 0, w: 1, h: 1 };
+      // Keeps the part you kept the same size, exactly where it was on the page.
+      var scaleX = item.w / old.w, scaleY = item.h / old.h, fullX = item.x - old.x * scaleX, fullY = item.y - old.y * scaleY;
+      var changed = Object.assign({}, item, {
+        crop: box, x: fullX + box.x * scaleX, y: fullY + box.y * scaleY, w: box.w * scaleX, h: box.h * scaleY
+      });
+      page.items = before.map(function (x) { return x === item ? changed : x; });
+      refresh(page);
+      pushHistory(page, before);
+      setSelection(v, new Set([item.id]));
+    });
   }
 
   function orderedTools() {
@@ -1984,6 +2164,46 @@
     });
   }
 
+  // Shows exactly what the tablet reports for the pen, so a button problem can be diagnosed.
+  function buttonTestPanel() {
+    var seen = { touching: false, hovering: false, eraserEnd: false, menu: 0, pen: false, cancelled: 0 };
+    var live = el('strong', { text: 'Waiting for the pen' });
+    var summary = el('p.button-result', { role: 'status', text: '' });
+    var box = el('div.button-test', { text: 'Test area: use your pen here' });
+    function update(e) {
+      if (e.pointerType === 'pen') seen.pen = true;
+      var hard = e.pointerType === 'pen' || e.pointerType === 'mouse';
+      if (hard && (e.buttons & 2 || e.button === 2)) {
+        if (e.buttons & 1) seen.touching = true; else if (e.type === 'pointerdown') seen.touching = true; else seen.hovering = true;
+      }
+      if (e.buttons & 32 || e.button === 5) seen.eraserEnd = true;
+      live.textContent = e.type.replace('pointer', '') + ' | ' + e.pointerType + ' | button ' + e.button + ' | buttons ' + e.buttons;
+      paint();
+    }
+    function paint() {
+      summary.textContent = [
+        'Pen seen: ' + (seen.pen ? 'yes' : 'no'),
+        'Button while touching: ' + (seen.touching ? 'yes' : 'no'),
+        'Button while hovering: ' + (seen.hovering ? 'yes' : 'no'),
+        'Eraser end: ' + (seen.eraserEnd ? 'yes' : 'no'),
+        'Long-press menu: ' + seen.menu,
+        'Strokes cancelled: ' + seen.cancelled
+      ].join('  ·  ');
+    }
+    ['pointerdown', 'pointermove', 'pointerup', 'pointerrawupdate'].forEach(function (name) {
+      box.addEventListener(name, update);
+    });
+    box.addEventListener('pointercancel', function (e) { seen.cancelled++; update(e); });
+    box.addEventListener('contextmenu', function (e) { e.preventDefault(); seen.menu++; paint(); });
+    paint();
+    return el('div.button-panel', null,
+      el('h3', { text: 'Pen button test' }),
+      el('p', { text: 'Try these in the area below: hold the button and hover, hold it and touch, then touch first and press it while drawing.' }),
+      box,
+      el('div.check-row', null, el('span', { text: 'Latest signal' }), live),
+      summary);
+  }
+
   function penCheck() {
     var secs = Math.max(0.001, (stats.end - stats.start) / 1000);
     var hasStroke = stats.type !== '-';
@@ -2010,6 +2230,7 @@
         el('h2', { text: 'Pen check' }),
         el('p', { text: 'Write a long, quick stroke on the page, then open this. A pressure range that changes as you press harder means pressure is working.' }),
         table,
+        buttonTestPanel(),
         el('div.dlg-actions', null, el('button.btn.primary', { type: 'button', text: 'Close', on: { click: function () { done(null); } } }))));
     });
   }
